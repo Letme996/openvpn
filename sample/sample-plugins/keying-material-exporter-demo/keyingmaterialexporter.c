@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -230,7 +230,8 @@ tls_final(struct openvpn_plugin_args_func_in const *args,
     snprintf(sess->key, sizeof(sess->key) - 1, "%s", key);
     ovpn_note("app session key:  %s", sess->key);
 
-    switch (plugin->type) {
+    switch (plugin->type)
+    {
         case SERVER:
             server_store(args);
             break;
@@ -249,7 +250,8 @@ openvpn_plugin_func_v3(const int version,
                        struct openvpn_plugin_args_func_in const *args,
                        struct openvpn_plugin_args_func_return *rv)
 {
-    switch (args->type) {
+    switch (args->type)
+    {
         case OPENVPN_PLUGIN_TLS_VERIFY:
             return tls_verify(args);
 

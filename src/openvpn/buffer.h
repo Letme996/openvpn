@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -347,9 +347,9 @@ buf_set_read(struct buffer *buf, const uint8_t *data, int size)
 static inline void
 strncpynt(char *dest, const char *src, size_t maxlen)
 {
-    strncpy(dest, src, maxlen);
     if (maxlen > 0)
     {
+        strncpy(dest, src, maxlen-1);
         dest[maxlen - 1] = 0;
     }
 }
@@ -448,6 +448,23 @@ __attribute__ ((format(__printf__, 3, 4)))
 #endif
 ;
 
+
+#ifdef _WIN32
+/*
+ * Like swprintf but guarantees null termination for size > 0
+ *
+ * This is under #ifdef because only Windows-specific code in tun.c
+ * uses this function and its implementation breaks OpenBSD <= 4.9
+ */
+bool
+openvpn_swprintf(wchar_t *const str, const size_t size, const wchar_t *const format, ...);
+
+/*
+ * Unlike in openvpn_snprintf, we cannot use format attributes since
+ * GCC doesn't support wprintf as archetype.
+ */
+#endif
+
 /*
  * remove/add trailing characters
  */
@@ -469,11 +486,15 @@ const char *skip_leading_whitespace(const char *str);
 
 void string_null_terminate(char *str, int len, int capacity);
 
-/*
- * Write string in buf to file descriptor fd.
- * NOTE: requires that string be null terminated.
+/**
+ * Write buffer contents to file.
+ *
+ * @param filename  The filename to write the buffer to.
+ * @param buf       The buffer to write to the file.
+ *
+ * @return true on success, false otherwise.
  */
-void buf_write_string_file(const struct buffer *buf, const char *filename, int fd);
+bool buffer_write_file(const char *filename, const struct buffer *buf);
 
 /*
  * write a string to the end of a buffer that was
@@ -833,6 +854,13 @@ buf_read_u32(struct buffer *buf, bool *good)
     }
 }
 
+/** Return true if buffer contents are equal */
+static inline bool
+buf_equal(const struct buffer *a, const struct buffer *b)
+{
+    return BLEN(a) == BLEN(b) && 0 == memcmp(BPTR(a), BPTR(b), BLEN(a));
+}
+
 /**
  * Compare src buffer contents with match.
  * *NOT* constant time. Do not use when comparing HMACs.
@@ -1087,29 +1115,108 @@ struct buffer_list
     int max_size;            /* maximum size list should grow to */
 };
 
+/**
+ * Allocate an empty buffer list of capacity \c max_size.
+ *
+ * @param max_size  the capacity of the list to allocate
+ *
+ * @return the new list
+ */
 struct buffer_list *buffer_list_new(const int max_size);
 
+/**
+ * Frees a buffer list and all the buffers in it.
+ *
+ * @param ol    the list to free
+ */
 void buffer_list_free(struct buffer_list *ol);
 
+/**
+ * Checks if the list is valid and non-empty
+ *
+ * @param ol    the list to check
+ *
+ * @return true iff \c ol is not NULL and contains at least one buffer
+ */
 bool buffer_list_defined(const struct buffer_list *ol);
 
+/**
+ * Empty the list \c ol and frees all the contained buffers
+ *
+ * @param ol    the list to reset
+ */
 void buffer_list_reset(struct buffer_list *ol);
 
+/**
+ * Allocates and appends a new buffer containing \c str as data to \c ol
+ *
+ * @param ol    the list to append the new buffer to
+ * @param str   the string to copy into the new buffer
+ */
 void buffer_list_push(struct buffer_list *ol, const char *str);
 
+/**
+ * Allocates and appends a new buffer containing \c data of length \c size.
+ *
+ * @param ol    the list to append the new buffer to
+ * @param data  the data to copy into the new buffer
+ * @param size  the length of \c data to copy into the buffer
+ *
+ * @return the new buffer
+ */
 struct buffer_entry *buffer_list_push_data(struct buffer_list *ol, const void *data, size_t size);
 
+/**
+ * Retrieve the head buffer
+ *
+ * @param ol    the list to retrieve the buffer from
+ *
+ * @return a pointer to the head buffer or NULL if the list is empty
+ */
 struct buffer *buffer_list_peek(struct buffer_list *ol);
 
 void buffer_list_advance(struct buffer_list *ol, int n);
 
 void buffer_list_pop(struct buffer_list *ol);
 
+/**
+ * Aggregates as many buffers as possible from \c bl in a new buffer of maximum
+ * length \c max_len .
+ * All the aggregated buffers are removed from the list and replaced by the new
+ * one, followed by any additional (non-aggregated) data.
+ *
+ * @param bl    the list of buffer to aggregate
+ * @param max   the maximum length of the aggregated buffer
+ */
 void buffer_list_aggregate(struct buffer_list *bl, const size_t max);
 
+/**
+ * Aggregates as many buffers as possible from \c bl in a new buffer
+ * of maximum length \c max_len . \c sep is written after
+ * each copied buffer (also after the last one). All the aggregated buffers are
+ * removed from the list and replaced by the new one, followed by any additional
+ * (non-aggregated) data.
+ * Nothing happens if \c max_len is not enough to aggregate at least 2 buffers.
+ *
+ * @param bl        the list of buffer to aggregate
+ * @param max_len   the maximum length of the aggregated buffer
+ * @param sep       the separator to put between buffers during aggregation
+ */
 void buffer_list_aggregate_separator(struct buffer_list *bl,
                                      const size_t max_len, const char *sep);
 
 struct buffer_list *buffer_list_file(const char *fn, int max_line_len);
+
+/**
+ * buffer_read_from_file - copy the content of a file into a buffer
+ *
+ * @param file      path to the file to read
+ * @param gc        the garbage collector to use when allocating the buffer. It
+ *                  is passed to alloc_buf_gc() and therefore can be NULL.
+ *
+ * @return the buffer storing the file content or an invalid buffer in case of
+ * error
+ */
+struct buffer buffer_read_from_file(const char *filename, struct gc_arena *gc);
 
 #endif /* BUFFER_H */

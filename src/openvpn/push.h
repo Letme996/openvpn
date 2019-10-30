@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -68,6 +68,14 @@ void remove_iroutes_from_push_route_list(struct options *o);
 void send_auth_failed(struct context *c, const char *client_reason);
 
 void send_restart(struct context *c, const char *kill_msg);
+
+/**
+ * Sends a push reply message only containin the auth-token to update
+ * the auth-token on the client
+ *
+ * @param multi  - The tls_multi structure belonging to the instance to push to
+ */
+void send_push_reply_auth_token(struct tls_multi *multi);
 
 #endif
 #endif /* if P2MP */

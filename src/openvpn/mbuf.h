@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -96,11 +96,11 @@ mbuf_maximum_queued(const struct mbuf_set *ms)
     return (int) ms->max_queued;
 }
 
+struct multi_instance *mbuf_peek_dowork(struct mbuf_set *ms);
+
 static inline struct multi_instance *
 mbuf_peek(struct mbuf_set *ms)
 {
-    struct multi_instance *mbuf_peek_dowork(struct mbuf_set *ms);
-
     if (mbuf_defined(ms))
     {
         return mbuf_peek_dowork(ms);

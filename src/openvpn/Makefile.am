@@ -5,7 +5,7 @@
 #             packet encryption, packet authentication, and
 #             packet compression.
 #
-#  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+#  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
 #  Copyright (C) 2006-2012 Alon Bar-Lev <alon.barlev@gmail.com>
 #
 
@@ -39,6 +39,7 @@ sbin_PROGRAMS = openvpn
 
 openvpn_SOURCES = \
 	argv.c argv.h \
+	auth_token.c auth_token.h \
 	base64.c base64.h \
 	basic.h \
 	buffer.c buffer.h \
@@ -51,11 +52,12 @@ openvpn_SOURCES = \
 	crypto_openssl.c crypto_openssl.h \
 	crypto_mbedtls.c crypto_mbedtls.h \
 	dhcp.c dhcp.h \
+	env_set.c env_set.h \
 	errlevel.h \
 	error.c error.h \
 	event.c event.h \
 	fdmisc.c fdmisc.h \
-	forward.c forward.h forward-inline.h \
+	forward.c forward.h \
 	fragment.c fragment.h \
 	gremlin.c gremlin.h \
 	helper.c helper.h \
@@ -79,8 +81,11 @@ openvpn_SOURCES = \
 	mtu.c mtu.h \
 	mudp.c mudp.h \
 	multi.c multi.h \
+	networking_iproute2.c networking_iproute2.h \
+	networking_sitnl.c networking_sitnl.h \
+	networking.h \
 	ntlm.c ntlm.h \
-	occ.c occ.h occ-inline.h \
+	occ.c occ.h \
 	openssl_compat.h \
 	pkcs11.c pkcs11.h pkcs11_backend.h \
 	pkcs11_openssl.c \
@@ -90,8 +95,8 @@ openvpn_SOURCES = \
 	otime.c otime.h \
 	packet_id.c packet_id.h \
 	perf.c perf.h \
-	pf.c pf.h pf-inline.h \
-	ping.c ping.h ping-inline.h \
+	pf.c pf.h \
+	ping.c ping.h \
 	plugin.c plugin.h \
 	pool.c pool.h \
 	proto.c proto.h \
@@ -101,6 +106,7 @@ openvpn_SOURCES = \
 	pushlist.h \
 	reliable.c reliable.h \
 	route.c route.h \
+	run_command.c run_command.h \
 	schedule.c schedule.h \
 	session_id.c session_id.h \
 	shaper.c shaper.h \

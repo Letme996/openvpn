@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *  Copyright (C) 2008-2013 David Sommerseth <dazo@users.sourceforge.net>
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -41,6 +41,7 @@
 #include "buffer.h"
 #include "error.h"
 #include "common.h"
+#include "run_command.h"
 #include "shaper.h"
 #include "crypto.h"
 #include "ssl.h"
@@ -199,8 +200,10 @@ static const char usage_message[] =
     "--route-ipv6 network/bits [gateway] [metric] :\n"
     "                  Add IPv6 route to routing table after connection\n"
     "                  is established.  Multiple routes can be specified.\n"
-    "                  gateway default: taken from 'remote' in --ifconfig-ipv6\n"
+    "                  gateway default: taken from --route-ipv6-gateway or 'remote'\n"
+    "                  in --ifconfig-ipv6\n"
     "--route-gateway gw|'dhcp' : Specify a default gateway for use with --route.\n"
+    "--route-ipv6-gateway gw : Specify a default gateway for use with --route-ipv6.\n"
     "--route-metric m : Specify a default metric for use with --route.\n"
     "--route-delay n [w] : Delay n seconds after connection initiation before\n"
     "                  adding routes (may be 0).  If not specified, routes will\n"
@@ -224,6 +227,10 @@ static const char usage_message[] =
     "                  Add 'bypass-dns' flag to similarly bypass tunnel for DNS.\n"
     "--redirect-private [flags]: Like --redirect-gateway, but omit actually changing\n"
     "                  the default gateway.  Useful when pushing private subnets.\n"
+    "--block-ipv6     : (Client) Instead sending IPv6 to the server generate\n"
+    "                   ICMPv6 host unreachable messages on the client.\n"
+    "                   (Server) Instead of forwarding IPv6 packets send\n"
+    "                   ICMPv6 host unreachable packets to the client.\n"
     "--client-nat snat|dnat network netmask alias : on client add 1-to-1 NAT rule.\n"
     "--push-peer-info : (client only) push client info to server.\n"
     "--setenv name value : Set a custom environmental variable to pass to script.\n"
@@ -444,7 +451,7 @@ static const char usage_message[] =
     "                  user/pass via environment, if method='via-file', pass\n"
     "                  user/pass via temporary file.\n"
     "--auth-gen-token  [lifetime] Generate a random authentication token which is pushed\n"
-    "                  to each client, replacing the password.  Usefull when\n"
+    "                  to each client, replacing the password.  Useful when\n"
     "                  OTP based two-factor auth mechanisms are in use and\n"
     "                  --reneg-* options are enabled. Optionally a lifetime in seconds\n"
     "                  for generated tokens can be set.\n"
@@ -621,6 +628,17 @@ static const char usage_message[] =
     "                  attacks on the TLS stack and DoS attacks.\n"
     "                  key (required) provides the pre-shared key file.\n"
     "                  see --secret option for more info.\n"
+    "--tls-crypt-v2 key : For clients: use key as a client-specific tls-crypt key.\n"
+    "                  For servers: use key to decrypt client-specific keys.  For\n"
+    "                  key generation (--tls-crypt-v2-genkey): use key to\n"
+    "                  encrypt generated client-specific key.  (See --tls-crypt.)\n"
+    "--genkey tls-crypt-v2-client [keyfile] [base64 metadata]: Generate a\n"
+    "                  fresh tls-crypt-v2 client key, and store to\n"
+    "                  keyfile.  If supplied, include metadata in wrapped key.\n"
+    "--genkey tls-crypt-v2-server [keyfile] [base64 metadata]: Generate a\n"
+    "                  fresh tls-crypt-v2 server key, and store to keyfile\n"
+    "--tls-crypt-v2-verify cmd : Run command cmd to verify the metadata of the\n"
+    "                  client-supplied tls-crypt-v2 client key\n"
     "--askpass [file]: Get PEM password from controlling tty before we daemonize.\n"
     "--auth-nocache  : Don't cache --askpass or --auth-user-pass passwords.\n"
     "--crl-verify crl ['dir']: Check peer certificate against a CRL.\n"
@@ -659,7 +677,7 @@ static const char usage_message[] =
     "--pkcs11-protected-authentication [0|1] ... : Use PKCS#11 protected authentication\n"
     "                              path. Set for each provider.\n"
     "--pkcs11-private-mode hex ...   : PKCS#11 private key mode mask.\n"
-    "                              0       : Try  to determind automatically (default).\n"
+    "                              0       : Try  to determine automatically (default).\n"
     "                              1       : Use Sign.\n"
     "                              2       : Use SignRecover.\n"
     "                              4       : Use Decrypt.\n"
@@ -703,8 +721,7 @@ static const char usage_message[] =
     "                    which allow multiple addresses,\n"
     "                    --dhcp-option must be repeated.\n"
     "                    DOMAIN name : Set DNS suffix\n"
-    "                    DNS addr    : Set domain name server address(es) (IPv4)\n"
-    "                    DNS6 addr   : Set domain name server address(es) (IPv6)\n"
+    "                    DNS addr    : Set domain name server address(es) (IPv4 and IPv6)\n"
     "                    NTP         : Set NTP server address(es)\n"
     "                    NBDD        : Set NBDD server address(es)\n"
     "                    WINS addr   : Set WINS server address(es)\n"
@@ -739,10 +756,9 @@ static const char usage_message[] =
     "                                 to access TAP adapter.\n"
 #endif /* ifdef _WIN32 */
     "\n"
-    "Generate a random key (only for non-TLS static key encryption mode):\n"
-    "--genkey        : Generate a random key to be used as a shared secret,\n"
-    "                  for use with the --secret option.\n"
-    "--secret file   : Write key to file.\n"
+    "Generate a new key :\n"
+    "--genkey secret file   : Generate a new random key of type and write to file\n"
+    "                         (for use with --secret, --tls-auth or --tls-crypt)."
 #ifdef ENABLE_FEATURE_TUN_PERSIST
     "\n"
     "Tun/tap config mode (available with linux 2.4+):\n"
@@ -885,7 +901,7 @@ init_options(struct options *o, const bool init_gc)
 
     /* Set default --tmp-dir */
 #ifdef _WIN32
-    /* On Windows, find temp dir via enviroment variables */
+    /* On Windows, find temp dir via environment variables */
     o->tmp_dir = win_get_tempdir();
 #else
     /* Non-windows platforms use $TMPDIR, and if not set, default to '/tmp' */
@@ -1023,67 +1039,6 @@ get_ip_addr(const char *ip_string, int msglevel, bool *error)
         *error = true;
     }
     return ret;
-}
-
-/* helper: parse a text string containing an IPv6 address + netbits
- * in "standard format" (2001:dba::/32)
- * "/nn" is optional, default to /64 if missing
- *
- * return true if parsing succeeded, modify *network and *netbits
- */
-bool
-get_ipv6_addr( const char *prefix_str, struct in6_addr *network,
-               unsigned int *netbits, int msglevel)
-{
-    char *sep, *endp;
-    int bits;
-    struct in6_addr t_network;
-
-    sep = strchr( prefix_str, '/' );
-    if (sep == NULL)
-    {
-        bits = 64;
-    }
-    else
-    {
-        bits = strtol( sep+1, &endp, 10 );
-        if (*endp != '\0' || bits < 0 || bits > 128)
-        {
-            msg(msglevel, "IPv6 prefix '%s': invalid '/bits' spec", prefix_str);
-            return false;
-        }
-    }
-
-    /* temporary replace '/' in caller-provided string with '\0', otherwise
-     * inet_pton() will refuse prefix string
-     * (alternative would be to strncpy() the prefix to temporary buffer)
-     */
-
-    if (sep != NULL)
-    {
-        *sep = '\0';
-    }
-
-    if (inet_pton( AF_INET6, prefix_str, &t_network ) != 1)
-    {
-        msg(msglevel, "IPv6 prefix '%s': invalid IPv6 address", prefix_str);
-        return false;
-    }
-
-    if (sep != NULL)
-    {
-        *sep = '/';
-    }
-
-    if (netbits != NULL)
-    {
-        *netbits = bits;
-    }
-    if (network != NULL)
-    {
-        *network = t_network;
-    }
-    return true;                /* parsing OK, values set */
 }
 
 /**
@@ -1226,6 +1181,20 @@ show_tuntap_options(const struct tuntap_options *o)
 
 #if defined(_WIN32) || defined(TARGET_ANDROID)
 static void
+dhcp_option_dns6_parse(const char *parm, struct in6_addr *dns6_list, int *len, int msglevel)
+{
+    struct in6_addr addr;
+    if (*len >= N_DHCP_ADDR)
+    {
+        msg(msglevel, "--dhcp-option DNS: maximum of %d IPv6 dns servers can be specified",
+            N_DHCP_ADDR);
+    }
+    else if (get_ipv6_addr(parm, &addr, NULL, msglevel))
+    {
+        dns6_list[(*len)++] = addr;
+    }
+}
+static void
 dhcp_option_address_parse(const char *name, const char *parm, in_addr_t *array, int *len, int msglevel)
 {
     if (*len >= N_DHCP_ADDR)
@@ -1320,6 +1289,7 @@ show_p2mp_parms(const struct options *o)
     SHOW_BOOL(auth_user_pass_verify_script_via_file);
     SHOW_BOOL(auth_token_generate);
     SHOW_INT(auth_token_lifetime);
+    SHOW_STR(auth_token_secret_file);
 #if PORT_SHARE
     SHOW_STR(port_share_host);
     SHOW_STR(port_share_port);
@@ -1493,6 +1463,12 @@ show_connection_entry(const struct connection_entry *o)
 #ifdef ENABLE_OCC
     SHOW_INT(explicit_exit_notification);
 #endif
+
+    SHOW_STR(tls_auth_file);
+    SHOW_PARM(key_direction, keydirection2ascii(o->key_direction, false, true),
+              "%s");
+    SHOW_STR(tls_crypt_file);
+    SHOW_STR(tls_crypt_v2_file);
 }
 
 
@@ -1554,6 +1530,7 @@ show_settings(const struct options *o)
     SHOW_BOOL(show_digests);
     SHOW_BOOL(show_engines);
     SHOW_BOOL(genkey);
+    SHOW_STR(genkey_filename);
     SHOW_STR(key_pass_file);
     SHOW_BOOL(show_tls_ciphers);
 
@@ -1691,7 +1668,7 @@ show_settings(const struct options *o)
 #endif
 
     SHOW_STR(shared_secret_file);
-    SHOW_INT(key_direction);
+    SHOW_PARM(key_direction, keydirection2ascii(o->key_direction, false, true), "%s");
     SHOW_STR(ciphername);
     SHOW_BOOL(ncp_enabled);
     SHOW_STR(ncp_ciphers);
@@ -1718,7 +1695,7 @@ show_settings(const struct options *o)
     SHOW_STR(ca_file);
     SHOW_STR(ca_path);
     SHOW_STR(dh_file);
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
     if ((o->management_flags & MF_EXTERNAL_CERT))
     {
         SHOW_PARM("cert_file","EXTERNAL_CERT","%s");
@@ -1728,7 +1705,7 @@ show_settings(const struct options *o)
     SHOW_STR(cert_file);
     SHOW_STR(extra_certs_file);
 
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
     if ((o->management_flags & MF_EXTERNAL_KEY))
     {
         SHOW_PARM("priv_key_file","EXTERNAL_PRIVATE_KEY","%s");
@@ -1743,6 +1720,7 @@ show_settings(const struct options *o)
     SHOW_STR(cryptoapi_cert);
 #endif
     SHOW_STR(cipher_list);
+    SHOW_STR(cipher_list_tls13);
     SHOW_STR(tls_cert_profile);
     SHOW_STR(tls_verify);
     SHOW_STR(tls_export_cert);
@@ -1773,8 +1751,7 @@ show_settings(const struct options *o)
     SHOW_BOOL(push_peer_info);
     SHOW_BOOL(tls_exit);
 
-    SHOW_STR(tls_auth_file);
-    SHOW_STR(tls_crypt_file);
+    SHOW_STR(tls_crypt_v2_metadata);
 
 #ifdef ENABLE_PKCS11
     {
@@ -2157,7 +2134,16 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
     {
         msg(M_USAGE, "--management-client-(user|group) can only be used on unix domain sockets");
     }
-#endif
+
+    if (options->management_addr
+        && !(options->management_flags & MF_UNIX_SOCK)
+        && (!options->management_user_pass))
+    {
+        msg(M_WARN, "WARNING: Using --management on a TCP port WITHOUT "
+            "passwords is STRONGLY discouraged and considered insecure");
+    }
+
+#endif /* ifdef ENABLE_MANAGEMENT */
 
     /*
      * Windows-specific options.
@@ -2247,7 +2233,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
         }
         if (options->pull_filter_list)
         {
-            msg(M_USAGE, "--pull-filter cannot be used with --mode server");
+            msg(M_WARN, "--pull-filter ignored for --mode server");
         }
         if (!(proto_is_udp(ce->proto) || ce->proto == PROTO_TCP_SERVER))
         {
@@ -2351,7 +2337,11 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
         {
             msg(M_USAGE, "--mode server requires --key-method 2");
         }
-
+        if (options->auth_token_generate && !options->renegotiate_seconds)
+        {
+            msg(M_USAGE, "--auth-gen-token needs a non-infinite "
+                "--renegotiate_seconds setting");
+        }
         {
             const bool ccnr = (options->auth_user_pass_verify_script
                                || PLUGIN_OPTION_LIST(options)
@@ -2459,10 +2449,6 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
         {
             msg(M_USAGE, "--stale-routes-check requires --mode server");
         }
-        if (compat_flag(COMPAT_FLAG_QUERY | COMPAT_NO_NAME_REMAPPING))
-        {
-            msg(M_USAGE, "--compat-x509-names no-remapping requires --mode server");
-        }
     }
 #endif /* P2MP_SERVER */
 
@@ -2509,6 +2495,18 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
             "in the configuration file, which is the recommended approach.");
     }
 
+    const int tls_version_max =
+        (options->ssl_flags >> SSLF_TLS_VERSION_MAX_SHIFT)
+        & SSLF_TLS_VERSION_MAX_MASK;
+    const int tls_version_min =
+        (options->ssl_flags >> SSLF_TLS_VERSION_MIN_SHIFT)
+        & SSLF_TLS_VERSION_MIN_MASK;
+
+    if (tls_version_max > 0 && tls_version_max < tls_version_min)
+    {
+        msg(M_USAGE, "--tls-version-min bigger than --tls-version-max");
+    }
+
     if (options->tls_server || options->tls_client)
     {
 #ifdef ENABLE_PKCS11
@@ -2532,7 +2530,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
             {
                 msg(M_USAGE, "Parameter --key cannot be used when --pkcs11-provider is also specified.");
             }
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
             if (options->management_flags & MF_EXTERNAL_KEY)
             {
                 msg(M_USAGE, "Parameter --management-external-key cannot be used when --pkcs11-provider is also specified.");
@@ -2555,7 +2553,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
         }
         else
 #endif /* ifdef ENABLE_PKCS11 */
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
         if ((options->management_flags & MF_EXTERNAL_KEY) && options->priv_key_file)
         {
             msg(M_USAGE, "--key and --management-external-key are mutually exclusive");
@@ -2592,7 +2590,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
             {
                 msg(M_USAGE, "Parameter --pkcs12 cannot be used when --cryptoapicert is also specified.");
             }
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
             if (options->management_flags & MF_EXTERNAL_KEY)
             {
                 msg(M_USAGE, "Parameter --management-external-key cannot be used when --cryptoapicert is also specified.");
@@ -2622,7 +2620,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
             {
                 msg(M_USAGE, "Parameter --key cannot be used when --pkcs12 is also specified.");
             }
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
             if (options->management_flags & MF_EXTERNAL_KEY)
             {
                 msg(M_USAGE, "Parameter --management-external-key cannot be used when --pkcs12 is also specified.");
@@ -2655,7 +2653,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
             {
 
                 const int sum =
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
                     ((options->cert_file != NULL) || (options->management_flags & MF_EXTERNAL_CERT))
                     +((options->priv_key_file != NULL) || (options->management_flags & MF_EXTERNAL_KEY));
 #else
@@ -2679,19 +2677,24 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
             }
             else
             {
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
                 if (!(options->management_flags & MF_EXTERNAL_CERT))
 #endif
                 notnull(options->cert_file, "certificate file (--cert) or PKCS#12 file (--pkcs12)");
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
                 if (!(options->management_flags & MF_EXTERNAL_KEY))
 #endif
                 notnull(options->priv_key_file, "private key file (--key) or PKCS#12 file (--pkcs12)");
             }
         }
-        if (options->tls_auth_file && options->tls_crypt_file)
+        if (ce->tls_auth_file && ce->tls_crypt_file)
         {
             msg(M_USAGE, "--tls-auth and --tls-crypt are mutually exclusive");
+        }
+        if (options->tls_client && ce->tls_crypt_v2_file
+            && (ce->tls_auth_file || ce->tls_crypt_file))
+        {
+            msg(M_USAGE, "--tls-crypt-v2, --tls-auth and --tls-crypt are mutually exclusive in client mode");
         }
     }
     else
@@ -2715,6 +2718,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
         MUST_BE_UNDEF(pkcs12_file);
 #endif
         MUST_BE_UNDEF(cipher_list);
+        MUST_BE_UNDEF(cipher_list_tls13);
         MUST_BE_UNDEF(tls_cert_profile);
         MUST_BE_UNDEF(tls_verify);
         MUST_BE_UNDEF(tls_export_cert);
@@ -2727,6 +2731,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
         MUST_BE_UNDEF(transition_window);
         MUST_BE_UNDEF(tls_auth_file);
         MUST_BE_UNDEF(tls_crypt_file);
+        MUST_BE_UNDEF(tls_crypt_v2_file);
         MUST_BE_UNDEF(single_session);
         MUST_BE_UNDEF(push_peer_info);
         MUST_BE_UNDEF(tls_exit);
@@ -2820,6 +2825,24 @@ options_postprocess_mutate_ce(struct options *o, struct connection_entry *ce)
 #endif
     }
 
+    /* our socks code is not fully IPv6 enabled yet (TCP works, UDP not)
+     * so fall back to IPv4-only (trac #1221)
+     */
+    if (ce->socks_proxy_server && proto_is_udp(ce->proto) && ce->af != AF_INET)
+    {
+        if (ce->af == AF_INET6)
+        {
+            msg(M_INFO, "WARNING: '--proto udp6' is not compatible with "
+                "'--socks-proxy' today.  Forcing IPv4 mode." );
+        }
+        else
+        {
+            msg(M_INFO, "NOTICE: dual-stack mode for '--proto udp' does not "
+                "work correctly with '--socks-proxy' today.  Forcing IPv4." );
+        }
+        ce->af = AF_INET;
+    }
+
     /*
      * Set MTU defaults
      */
@@ -2835,6 +2858,56 @@ options_postprocess_mutate_ce(struct options *o, struct connection_entry *ce)
         }
     }
 
+    /*
+     * Set per-connection block tls-auth/crypt/crypto-v2 fields if undefined.
+     *
+     * At the end only one of these will be really set because the parser
+     * logic prevents configurations where more are set.
+     */
+    if (!ce->tls_auth_file && !ce->tls_crypt_file && !ce->tls_crypt_v2_file)
+    {
+        ce->tls_auth_file = o->tls_auth_file;
+        ce->tls_auth_file_inline = o->tls_auth_file_inline;
+        ce->key_direction = o->key_direction;
+
+        ce->tls_crypt_file = o->tls_crypt_file;
+        ce->tls_crypt_inline = o->tls_crypt_inline;
+
+        ce->tls_crypt_v2_file = o->tls_crypt_v2_file;
+        ce->tls_crypt_v2_inline = o->tls_crypt_v2_inline;
+    }
+
+    /* pre-cache tls-auth/crypt key file if persist-key was specified and keys
+     * were not already embedded in the config file
+     */
+    if (o->persist_key)
+    {
+        if (ce->tls_auth_file && !ce->tls_auth_file_inline)
+        {
+            struct buffer in = buffer_read_from_file(ce->tls_auth_file, &o->gc);
+            if (!buf_valid(&in))
+            {
+                msg(M_FATAL, "Cannot pre-load tls-auth keyfile (%s)",
+                    ce->tls_auth_file);
+            }
+
+            ce->tls_auth_file = INLINE_FILE_TAG;
+            ce->tls_auth_file_inline = (char *)in.data;
+        }
+
+        if (ce->tls_crypt_file && !ce->tls_crypt_inline)
+        {
+            struct buffer in = buffer_read_from_file(ce->tls_crypt_file, &o->gc);
+            if (!buf_valid(&in))
+            {
+                msg(M_FATAL, "Cannot pre-load tls-crypt keyfile (%s)",
+                    ce->tls_crypt_file);
+            }
+
+            ce->tls_crypt_file = INLINE_FILE_TAG;
+            ce->tls_crypt_inline = (char *)in.data;
+        }
+    }
 }
 
 #ifdef _WIN32
@@ -2998,7 +3071,7 @@ options_postprocess_mutate(struct options *o)
     {
         /* DH file is only meaningful in a tls-server context. */
         msg(M_WARN, "WARNING: Ignoring option 'dh' in tls-client mode, please only "
-                    "include this in your server configuration");
+            "include this in your server configuration");
         o->dh_file = NULL;
     }
 
@@ -3032,8 +3105,8 @@ options_postprocess_mutate(struct options *o)
  */
 #ifndef ENABLE_SMALL  /** Expect people using the stripped down version to know what they do */
 
-#define CHKACC_FILE (1<<0)       /** Check for a file/directory precense */
-#define CHKACC_DIRPATH (1<<1)    /** Check for directory precense where a file should reside */
+#define CHKACC_FILE (1<<0)       /** Check for a file/directory presence */
+#define CHKACC_DIRPATH (1<<1)    /** Check for directory presence where a file should reside */
 #define CHKACC_FILEXSTWR (1<<2)  /** If file exists, is it writable? */
 #define CHKACC_INLINE (1<<3)     /** File is present if it's an inline file */
 #define CHKACC_ACPTSTDIN (1<<4)  /** If filename is stdin, it's allowed and "exists" */
@@ -3067,7 +3140,7 @@ check_file_access(const int type, const char *file, const int mode, const char *
     /* Is the directory path leading to the given file accessible? */
     if (type & CHKACC_DIRPATH)
     {
-        char *fullpath = string_alloc(file, NULL); /* POSIX dirname() implementaion may modify its arguments */
+        char *fullpath = string_alloc(file, NULL); /* POSIX dirname() implementation may modify its arguments */
         char *dirpath = dirname(fullpath);
 
         if (platform_access(dirpath, mode|X_OK) != 0)
@@ -3117,7 +3190,7 @@ check_file_access(const int type, const char *file, const int mode, const char *
         msg(M_NOPREFIX | M_OPTERR | M_ERRNO, "%s fails with '%s'", opt, file);
     }
 
-    /* Return true if an error occured */
+    /* Return true if an error occurred */
     return (errcode != 0 ? true : false);
 }
 
@@ -3230,7 +3303,7 @@ options_postprocess_filechecks(struct options *options)
     errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE, options->cert_file, R_OK, "--cert");
     errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE, options->extra_certs_file, R_OK,
                               "--extra-certs");
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
     if (!(options->management_flags & MF_EXTERNAL_KEY))
 #endif
     {
@@ -3251,12 +3324,28 @@ options_postprocess_filechecks(struct options *options)
                                          options->crl_file, R_OK, "--crl-verify");
     }
 
+    ASSERT(options->connection_list);
+    for (int i = 0; i < options->connection_list->len; ++i)
+    {
+        struct connection_entry *ce = options->connection_list->array[i];
+
+        errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE|CHKACC_PRIVATE,
+                                  ce->tls_auth_file, R_OK, "--tls-auth");
+
+        errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE|CHKACC_PRIVATE,
+                                  ce->tls_crypt_file, R_OK, "--tls-crypt");
+
+        errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE|CHKACC_PRIVATE,
+                                  ce->tls_crypt_v2_file, R_OK,
+                                  "--tls-crypt-v2");
+    }
+
     errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE|CHKACC_PRIVATE,
-                              options->tls_auth_file, R_OK, "--tls-auth");
-    errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE|CHKACC_PRIVATE,
-                              options->tls_crypt_file, R_OK, "--tls-crypt");
+                              options->genkey_filename, R_OK,
+                              "--genkey");
     errs |= check_file_access(CHKACC_FILE|CHKACC_INLINE|CHKACC_PRIVATE,
                               options->shared_secret_file, R_OK, "--secret");
+
     errs |= check_file_access(CHKACC_DIRPATH|CHKACC_FILEXSTWR,
                               options->packet_id_file, R_OK|W_OK, "--replay-persist");
 
@@ -3421,7 +3510,7 @@ calc_options_string_link_mtu(const struct options *o, const struct frame *frame)
         struct key_type fake_kt;
         init_key_type(&fake_kt, o->ciphername, o->authname, o->keysize, true,
                       false);
-        frame_add_to_extra_frame(&fake_frame, -(crypto_max_overhead()));
+        frame_remove_from_extra_frame(&fake_frame, crypto_max_overhead());
         crypto_adjust_frame_parameters(&fake_frame, &fake_kt, o->replay,
                                        cipher_kt_mode_ofb_cfb(fake_kt.cipher));
         frame_finalize(&fake_frame, o->ce.link_mtu_defined, o->ce.link_mtu,
@@ -3480,6 +3569,7 @@ char *
 options_string(const struct options *o,
                const struct frame *frame,
                struct tuntap *tt,
+               openvpn_net_ctx_t *ctx,
                bool remote,
                struct gc_arena *gc)
 {
@@ -3522,7 +3612,8 @@ options_string(const struct options *o,
                       NULL,
                       NULL,
                       false,
-                      NULL);
+                      NULL,
+                      ctx);
         if (tt)
         {
             tt_local = true;
@@ -3564,7 +3655,7 @@ options_string(const struct options *o,
      * Key direction
      */
     {
-        const char *kd = keydirection2ascii(o->key_direction, remote);
+        const char *kd = keydirection2ascii(o->key_direction, remote, false);
         if (kd)
         {
             buf_printf(&out, ",keydir %s", kd);
@@ -3613,7 +3704,7 @@ options_string(const struct options *o,
     {
         if (TLS_CLIENT || TLS_SERVER)
         {
-            if (o->tls_auth_file)
+            if (o->ce.tls_auth_file)
             {
                 buf_printf(&out, ",tls-auth");
             }
@@ -3700,11 +3791,15 @@ options_warning_safe_scan2(const int msglevel,
                            const char *b1_name,
                            const char *b2_name)
 {
-    /* we will stop sending 'proto xxx' in OCC in a future version
-     * (because it's not useful), and to reduce questions when
-     * interoperating, we start not-printing a warning about it today
+    /* We will stop sending 'key-method', 'keydir', 'proto' and 'tls-auth' in
+     * OCC in a future version (because it's not useful). To reduce questions
+     * when interoperating, we no longer printing a warning about it.
      */
-    if (strncmp(p1, "proto ", 6) == 0)
+    if (strprefix(p1, "key-method ")
+        || strprefix(p1, "keydir ")
+        || strprefix(p1, "proto ")
+        || strprefix(p1, "tls-auth ")
+        || strprefix(p1, "tun-ipv6"))
     {
         return;
     }
@@ -4090,7 +4185,7 @@ usage_version(void)
     show_windows_version( M_INFO|M_NOPREFIX );
 #endif
     msg(M_INFO|M_NOPREFIX, "Originally developed by James Yonan");
-    msg(M_INFO|M_NOPREFIX, "Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>");
+    msg(M_INFO|M_NOPREFIX, "Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>");
 #ifndef ENABLE_SMALL
 #ifdef CONFIGURE_DEFINES
     msg(M_INFO|M_NOPREFIX, "Compile time defines: %s", CONFIGURE_DEFINES);
@@ -4932,13 +5027,15 @@ add_option(struct options *options,
         struct route_gateway_info rgi;
         struct route_ipv6_gateway_info rgi6;
         struct in6_addr remote = IN6ADDR_ANY_INIT;
+        openvpn_net_ctx_t net_ctx;
         VERIFY_PERMISSION(OPT_P_GENERAL);
         if (p[1])
         {
             get_ipv6_addr(p[1], &remote, NULL, M_WARN);
         }
-        get_default_gateway(&rgi);
-        get_default_gateway_ipv6(&rgi6, &remote);
+        net_ctx_init(NULL, &net_ctx);
+        get_default_gateway(&rgi, &net_ctx);
+        get_default_gateway_ipv6(&rgi6, &remote, &net_ctx);
         print_default_gateway(M_INFO, &rgi, &rgi6);
         openvpn_exit(OPENVPN_EXIT_STATUS_GOOD); /* exit point */
     }
@@ -5063,7 +5160,7 @@ add_option(struct options *options,
         options->management_flags |= MF_CONNECT_AS_CLIENT;
         options->management_write_peer_info_file = p[1];
     }
-#ifdef MANAGMENT_EXTERNAL_KEY
+#ifdef ENABLE_MANAGEMENT
     else if (streq(p[0], "management-external-key") && !p[1])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
@@ -6162,6 +6259,18 @@ add_option(struct options *options,
             }
         }
     }
+    else if (streq(p[0], "route-ipv6-gateway") && p[1] && !p[2])
+    {
+        if (ipv6_addr_safe(p[1]))
+        {
+            options->route_ipv6_default_gateway = p[1];
+        }
+        else
+        {
+            msg(msglevel, "route-ipv6-gateway parm '%s' must be a valid address", p[1]);
+            goto err;
+        }
+    }
     else if (streq(p[0], "route-metric") && p[1] && !p[2])
     {
         VERIFY_PERMISSION(OPT_P_ROUTE);
@@ -6302,6 +6411,11 @@ add_option(struct options *options,
 #endif
         options->routes->flags |= RG_ENABLE;
     }
+    else if (streq(p[0], "block-ipv6") && !p[1])
+    {
+        VERIFY_PERMISSION(OPT_P_ROUTE);
+        options->block_ipv6 = true;
+    }
     else if (streq(p[0], "remote-random-hostname") && !p[1])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
@@ -6345,7 +6459,7 @@ add_option(struct options *options,
     else if (streq(p[0], "script-security") && p[1] && !p[2])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
-        script_security = atoi(p[1]);
+        script_security_set(atoi(p[1]));
     }
     else if (streq(p[0], "mssfix") && !p[2])
     {
@@ -6674,11 +6788,34 @@ add_option(struct options *options,
                         &options->auth_user_pass_verify_script,
                         p[1], "auth-user-pass-verify", true);
     }
-    else if (streq(p[0], "auth-gen-token"))
+    else if (streq(p[0], "auth-gen-token") && !p[3])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
         options->auth_token_generate = true;
         options->auth_token_lifetime = p[1] ? positive_atoi(p[1]) : 0;
+        if (p[2])
+        {
+            if (streq(p[2], "external-auth"))
+            {
+                options->auth_token_call_auth = true;
+            }
+            else
+            {
+                msg(msglevel, "Invalid argument to auth-gen-token: %s", p[2]);
+            }
+        }
+
+    }
+    else if (streq(p[0], "auth-gen-token-secret") && p[1] && (!p[2]
+                                                              || (p[2] && streq(p[1], INLINE_FILE_TAG))))
+    {
+        VERIFY_PERMISSION(OPT_P_GENERAL);
+        options->auth_token_secret_file = p[1];
+
+        if (streq(p[1], INLINE_FILE_TAG) && p[2])
+        {
+            options->auth_token_secret_file_inline = p[2];
+        }
     }
     else if (streq(p[0], "client-connect") && p[1])
     {
@@ -6931,7 +7068,7 @@ add_option(struct options *options,
         VERIFY_PERMISSION(OPT_P_GENERAL);
         auth_retry_set(msglevel, p[1]);
     }
-#ifdef ENABLE_CLIENT_CR
+#ifdef ENABLE_MANAGEMENT
     else if (streq(p[0], "static-challenge") && p[1] && p[2] && !p[3])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
@@ -7059,6 +7196,7 @@ add_option(struct options *options,
     {
         struct tuntap_options *o = &options->tuntap_options;
         VERIFY_PERMISSION(OPT_P_IPWIN32);
+        bool ipv6dns = false;
 
         if (streq(p[1], "DOMAIN") && p[2])
         {
@@ -7079,22 +7217,17 @@ add_option(struct options *options,
             }
             o->netbios_node_type = t;
         }
-        else if (streq(p[1], "DNS") && p[2])
+        else if ((streq(p[1], "DNS") || streq(p[1], "DNS6")) && p[2] && (!strstr(p[2], ":") || ipv6_addr_safe(p[2])))
         {
-            dhcp_option_address_parse("DNS", p[2], o->dns, &o->dns_len, msglevel);
-        }
-        else if (streq(p[1], "DNS6") && p[2] && ipv6_addr_safe(p[2]))
-        {
-            struct in6_addr addr;
-            foreign_option(options, p, 3, es);
-            if (o->dns6_len >= N_DHCP_ADDR)
+            if (strstr(p[2], ":"))
             {
-                msg(msglevel, "--dhcp-option DNS6: maximum of %d dns servers can be specified",
-                    N_DHCP_ADDR);
+                ipv6dns = true;
+                foreign_option(options, p, 3, es);
+                dhcp_option_dns6_parse(p[2], o->dns6, &o->dns6_len, msglevel);
             }
-            else if (get_ipv6_addr(p[2], &addr, NULL, msglevel))
+            else
             {
-                o->dns6[o->dns6_len++] = addr;
+                dhcp_option_address_parse("DNS", p[2], o->dns, &o->dns_len, msglevel);
             }
         }
         else if (streq(p[1], "WINS") && p[2])
@@ -7122,7 +7255,7 @@ add_option(struct options *options,
         /* flag that we have options to give to the TAP driver's DHCPv4 server
          *  - skipped for "DNS6", as that's not a DHCPv4 option
          */
-        if (!streq(p[1], "DNS6"))
+        if (!ipv6dns)
         {
             o->dhcp_options = true;
         }
@@ -7390,10 +7523,19 @@ add_option(struct options *options,
     {
         int key_direction;
 
+        VERIFY_PERMISSION(OPT_P_GENERAL|OPT_P_CONNECTION);
+
         key_direction = ascii2keydirection(msglevel, p[1]);
         if (key_direction >= 0)
         {
-            options->key_direction = key_direction;
+            if (permission_mask & OPT_P_GENERAL)
+            {
+                options->key_direction = key_direction;
+            }
+            else if (permission_mask & OPT_P_CONNECTION)
+            {
+                options->ce.key_direction = key_direction;
+            }
         }
         else
         {
@@ -7423,10 +7565,47 @@ add_option(struct options *options,
         }
         options->shared_secret_file = p[1];
     }
-    else if (streq(p[0], "genkey") && !p[1])
+    else if (streq(p[0], "genkey") && !p[4])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
         options->genkey = true;
+        if (!p[1])
+        {
+            options->genkey_type = GENKEY_SECRET;
+        }
+        else
+        {
+            if (streq(p[1], "secret") || streq(p[1], "tls-auth") ||
+                streq(p[1], "tls-crypt"))
+            {
+                options->genkey_type = GENKEY_SECRET;
+            }
+            else if (streq(p[1], "tls-crypt-v2-server"))
+            {
+                options->genkey_type = GENKEY_TLS_CRYPTV2_SERVER;
+            }
+            else if (streq(p[1], "tls-crypt-v2-client"))
+            {
+                options->genkey_type = GENKEY_TLS_CRYPTV2_CLIENT;
+                if (p[3])
+                {
+                    options->genkey_extra_data = p[3];
+                }
+            }
+            else if (streq(p[1], "auth-token"))
+            {
+                options->genkey_type = GENKEY_AUTH_TOKEN;
+            }
+            else
+            {
+                msg(msglevel, "unknown --genkey type: %s", p[1]);
+            }
+
+        }
+        if (p[2])
+        {
+            options->genkey_filename = p[2];
+        }
     }
     else if (streq(p[0], "auth") && p[1] && !p[2])
     {
@@ -7771,6 +7950,11 @@ add_option(struct options *options,
         VERIFY_PERMISSION(OPT_P_GENERAL);
         options->tls_cert_profile = p[1];
     }
+    else if (streq(p[0], "tls-ciphersuites") && p[1] && !p[2])
+    {
+        VERIFY_PERMISSION(OPT_P_GENERAL);
+        options->cipher_list_tls13 = p[1];
+    }
     else if (streq(p[0], "crl-verify") && p[1] && ((p[2] && streq(p[2], "dir"))
                                                    || (p[2] && streq(p[1], INLINE_FILE_TAG) ) || !p[2]) && !p[3])
     {
@@ -7803,49 +7987,24 @@ add_option(struct options *options,
         options->tls_export_cert = p[1];
     }
 #endif
-#if P2MP_SERVER
-    else if (streq(p[0], "compat-names") && ((p[1] && streq(p[1], "no-remapping")) || !p[1]) && !p[2])
-#else
-    else if (streq(p[0], "compat-names") && !p[1])
-#endif
+    else if (streq(p[0], "compat-names"))
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
-        if (options->verify_x509_type != VERIFY_X509_NONE)
-        {
-            msg(msglevel, "you cannot use --compat-names with --verify-x509-name");
-            goto err;
-        }
-        msg(M_WARN, "DEPRECATED OPTION: --compat-names, please update your configuration. This will be removed in OpenVPN 2.5.");
-        compat_flag(COMPAT_FLAG_SET | COMPAT_NAMES);
-#if P2MP_SERVER
-        if (p[1] && streq(p[1], "no-remapping"))
-        {
-            compat_flag(COMPAT_FLAG_SET | COMPAT_NO_NAME_REMAPPING);
-        }
+        msg(msglevel, "--compat-names was removed in OpenVPN 2.5. "
+            "Update your configuration.");
+        goto err;
     }
     else if (streq(p[0], "no-name-remapping") && !p[1])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
-        if (options->verify_x509_type != VERIFY_X509_NONE)
-        {
-            msg(msglevel, "you cannot use --no-name-remapping with --verify-x509-name");
-            goto err;
-        }
-        msg(M_WARN, "DEPRECATED OPTION: --no-name-remapping, please update your configuration. This will be removed in OpenVPN 2.5.");
-        compat_flag(COMPAT_FLAG_SET | COMPAT_NAMES);
-        compat_flag(COMPAT_FLAG_SET | COMPAT_NO_NAME_REMAPPING);
-#endif
+        msg(msglevel, "--no-name-remapping was removed in OpenVPN 2.5. "
+            "Update your configuration.");
+        goto err;
     }
     else if (streq(p[0], "verify-x509-name") && p[1] && strlen(p[1]) && !p[3])
     {
         int type = VERIFY_X509_SUBJECT_DN;
         VERIFY_PERMISSION(OPT_P_GENERAL);
-        if (compat_flag(COMPAT_FLAG_QUERY | COMPAT_NAMES))
-        {
-            msg(msglevel, "you cannot use --verify-x509-name with "
-                "--compat-names or --no-name-remapping");
-            goto err;
-        }
         if (p[2])
         {
             if (streq(p[2], "subject"))
@@ -7962,35 +8121,91 @@ add_option(struct options *options,
     }
     else if (streq(p[0], "tls-auth") && p[1] && !p[3])
     {
-        VERIFY_PERMISSION(OPT_P_GENERAL);
-        if (streq(p[1], INLINE_FILE_TAG) && p[2])
-        {
-            options->tls_auth_file_inline = p[2];
-        }
-        else if (p[2])
-        {
-            int key_direction;
+        int key_direction = -1;
 
-            key_direction = ascii2keydirection(msglevel, p[2]);
-            if (key_direction >= 0)
+        VERIFY_PERMISSION(OPT_P_GENERAL|OPT_P_CONNECTION);
+
+        if (permission_mask & OPT_P_GENERAL)
+        {
+            if (streq(p[1], INLINE_FILE_TAG) && p[2])
             {
+                options->tls_auth_file_inline = p[2];
+            }
+            else if (p[2])
+            {
+                key_direction = ascii2keydirection(msglevel, p[2]);
+                if (key_direction < 0)
+                {
+                    goto err;
+                }
                 options->key_direction = key_direction;
             }
-            else
-            {
-                goto err;
-            }
+            options->tls_auth_file = p[1];
         }
-        options->tls_auth_file = p[1];
+        else if (permission_mask & OPT_P_CONNECTION)
+        {
+            options->ce.key_direction = KEY_DIRECTION_BIDIRECTIONAL;
+            if (streq(p[1], INLINE_FILE_TAG) && p[2])
+            {
+                options->ce.tls_auth_file_inline = p[2];
+            }
+            else if (p[2])
+            {
+                key_direction = ascii2keydirection(msglevel, p[2]);
+                if (key_direction < 0)
+                {
+                    goto err;
+                }
+                options->ce.key_direction = key_direction;
+            }
+            options->ce.tls_auth_file = p[1];
+        }
     }
     else if (streq(p[0], "tls-crypt") && p[1] && !p[3])
     {
-        VERIFY_PERMISSION(OPT_P_GENERAL);
-        if (streq(p[1], INLINE_FILE_TAG) && p[2])
+        VERIFY_PERMISSION(OPT_P_GENERAL|OPT_P_CONNECTION);
+        if (permission_mask & OPT_P_GENERAL)
         {
-            options->tls_crypt_inline = p[2];
+            if (streq(p[1], INLINE_FILE_TAG) && p[2])
+            {
+                options->tls_crypt_inline = p[2];
+            }
+            options->tls_crypt_file = p[1];
         }
-        options->tls_crypt_file = p[1];
+        else if (permission_mask & OPT_P_CONNECTION)
+        {
+            if (streq(p[1], INLINE_FILE_TAG) && p[2])
+            {
+                options->ce.tls_crypt_inline = p[2];
+            }
+            options->ce.tls_crypt_file = p[1];
+
+        }
+    }
+    else if (streq(p[0], "tls-crypt-v2") && p[1] && !p[3])
+    {
+        VERIFY_PERMISSION(OPT_P_GENERAL|OPT_P_CONNECTION);
+        if (permission_mask & OPT_P_GENERAL)
+        {
+            if (streq(p[1], INLINE_FILE_TAG) && p[2])
+            {
+                options->tls_crypt_v2_inline = p[2];
+            }
+            options->tls_crypt_v2_file = p[1];
+        }
+        else if (permission_mask & OPT_P_CONNECTION)
+        {
+            if (streq(p[1], INLINE_FILE_TAG) && p[2])
+            {
+                options->ce.tls_crypt_v2_inline = p[2];
+            }
+            options->ce.tls_crypt_v2_file = p[1];
+        }
+    }
+    else if (streq(p[0], "tls-crypt-v2-verify") && p[1] && !p[2])
+    {
+        VERIFY_PERMISSION(OPT_P_GENERAL);
+        options->tls_crypt_v2_verify_script = p[1];
     }
     else if (streq(p[0], "key-method") && p[1] && !p[2])
     {

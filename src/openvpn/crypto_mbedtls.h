@@ -5,8 +5,8 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
- *  Copyright (C) 2010-2017 Fox Crypto B.V. <openvpn@fox-it.com>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2010-2018 Fox Crypto B.V. <openvpn@fox-it.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -146,5 +146,10 @@ mbed_log_func_line_lite(unsigned int flags, int errval,
 #define mbed_ok(errval) \
     mbed_log_func_line_lite(D_CRYPT_ERRORS, errval, __func__, __LINE__)
 
+static inline bool
+cipher_kt_var_key_size(const cipher_kt_t *cipher)
+{
+    return cipher->flags & MBEDTLS_CIPHER_VARIABLE_KEY_LEN;
+}
 
 #endif /* CRYPTO_MBEDTLS_H_ */

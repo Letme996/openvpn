@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -42,10 +42,10 @@
 #include "sig.h"
 #include "misc.h"
 #include "mbuf.h"
+#include "pf.h"
 #include "pool.h"
 #include "plugin.h"
 #include "manage.h"
-#include "pf.h"
 
 /*
  * Our global key schedules, packaged thusly
@@ -66,6 +66,9 @@ struct key_schedule
     /* optional TLS control channel wrapping */
     struct key_type tls_auth_key_type;
     struct key_ctx_bi tls_wrap_key;
+    struct key_ctx tls_crypt_v2_server_key;
+    struct buffer tls_crypt_v2_wkc;             /**< Wrapped client key */
+    struct key_ctx auth_token_key;
 };
 
 /*
@@ -263,6 +266,7 @@ struct context_2
     /* Object to handle advanced MTU negotiation and datagram fragmentation */
     struct fragment_master *fragment;
     struct frame frame_fragment;
+    struct frame frame_fragment_initial;
     struct frame frame_fragment_omit;
 #endif
 
@@ -519,6 +523,8 @@ struct context
                                  *   context structure. */
 
     struct env_set *es;         /**< Set of environment variables. */
+
+    openvpn_net_ctx_t net_ctx;	/**< Networking API opaque context */
 
     struct signal_info *sig;    /**< Internal error signaling object. */
 

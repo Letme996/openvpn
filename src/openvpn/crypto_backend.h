@@ -5,8 +5,8 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
- *  Copyright (C) 2010-2017 Fox Crypto B.V. <openvpn@fox-it.com>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2010-2018 Fox Crypto B.V. <openvpn@fox-it.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -36,6 +36,7 @@
 #include "crypto_mbedtls.h"
 #endif
 #include "basic.h"
+#include "buffer.h"
 
 /* TLS uses a tag of 128 bytes, let's do the same for OpenVPN */
 #define OPENVPN_AEAD_TAG_LENGTH 16
@@ -50,7 +51,7 @@
 typedef enum {
     MD_SHA1,
     MD_SHA256
-} hash_algo_type ;
+} hash_algo_type;
 
 /** Struct used in cipher name translation table */
 typedef struct {
@@ -104,6 +105,34 @@ void show_available_ciphers(void);
 void show_available_digests(void);
 
 void show_available_engines(void);
+
+/**
+ * Encode binary data as PEM.
+ *
+ * @param name      The name to use in the PEM header/footer.
+ * @param dst       Destination buffer for PEM-encoded data.  Must be a valid
+ *                  pointer to an uninitialized buffer structure.  Iff this
+ *                  function returns true, the buffer will contain memory
+ *                  allocated through the supplied gc.
+ * @param src       Source buffer.
+ * @param gc        The garbage collector to use when allocating memory for dst.
+ *
+ * @return true iff PEM encode succeeded.
+ */
+bool crypto_pem_encode(const char *name, struct buffer *dst,
+                       const struct buffer *src, struct gc_arena *gc);
+
+/**
+ * Decode a PEM buffer to binary data.
+ *
+ * @param name      The name expected in the PEM header/footer.
+ * @param dst       Destination buffer for decoded data.
+ * @param src       Source buffer (PEM data).
+ *
+ * @return true iff PEM decode succeeded.
+ */
+bool crypto_pem_decode(const char *name, struct buffer *dst,
+                       const struct buffer *src);
 
 /*
  *
@@ -256,6 +285,11 @@ int cipher_kt_block_size(const cipher_kt_t *cipher_kt);
 int cipher_kt_tag_size(const cipher_kt_t *cipher_kt);
 
 /**
+ * Returns true if we consider this cipher to be insecure.
+ */
+bool cipher_kt_insecure(const cipher_kt_t *cipher);
+
+/**
  * Returns the mode that the cipher runs in.
  *
  * @param cipher_kt     Static cipher parameters. May not be NULL.
@@ -307,7 +341,7 @@ bool cipher_kt_mode_aead(const cipher_kt_t *cipher);
 cipher_ctx_t *cipher_ctx_new(void);
 
 /**
- * Free a cipher context
+ * Cleanup and free a cipher context
  *
  * @param ctx           Cipher context.
  */
@@ -325,13 +359,6 @@ void cipher_ctx_free(cipher_ctx_t *ctx);
  */
 void cipher_ctx_init(cipher_ctx_t *ctx, const uint8_t *key, int key_len,
                      const cipher_kt_t *kt, int enc);
-
-/**
- * Cleanup the specified context.
- *
- * @param ctx   Cipher context to cleanup.
- */
-void cipher_ctx_cleanup(cipher_ctx_t *ctx);
 
 /**
  * Returns the size of the IV used by the cipher, in bytes, or 0 if no IV is
@@ -600,7 +627,7 @@ void hmac_ctx_free(hmac_ctx_t *ctx);
  * Initialises the given HMAC context, using the given digest
  * and key.
  *
- * @param ctx           HMAC context to intialise
+ * @param ctx           HMAC context to initialise
  * @param key           The key to use for the HMAC
  * @param key_len       The key length to use
  * @param kt            Static message digest parameters

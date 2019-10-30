@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -39,7 +39,9 @@
 
 #if P2MP
 
+#ifdef P2MP_SERVER
 static char push_reply_cmd[] = "PUSH_REPLY";
+#endif
 
 /*
  * Auth username/password
@@ -55,8 +57,20 @@ receive_auth_failed(struct context *c, const struct buffer *buffer)
 
     if (c->options.pull)
     {
-        switch (auth_retry_get())
+        /* Before checking how to react on AUTH_FAILED, first check if the
+         * failed auth might be the result of an expired auth-token.
+         * Note that a server restart will trigger a generic AUTH_FAILED
+         * instead an AUTH_FAILED,SESSION so handle all AUTH_FAILED message
+         * identical for this scenario */
+        if (ssl_clean_auth_token())
         {
+            c->sig->signal_received = SIGUSR1; /* SOFT-SIGUSR1 -- Auth failure error */
+            c->sig->signal_text = "auth-failure (auth-token)";
+        }
+        else
+        {
+            switch (auth_retry_get())
+            {
             case AR_NONE:
                 c->sig->signal_received = SIGTERM; /* SOFT-SIGTERM -- Auth failure error */
                 break;
@@ -70,8 +84,9 @@ receive_auth_failed(struct context *c, const struct buffer *buffer)
 
             default:
                 ASSERT(0);
+            }
+            c->sig->signal_text = "auth-failure";
         }
-        c->sig->signal_text = "auth-failure";
 #ifdef ENABLE_MANAGEMENT
         if (management)
         {
@@ -88,7 +103,7 @@ receive_auth_failed(struct context *c, const struct buffer *buffer)
          * Save the dynamic-challenge text even when management is defined
          */
         {
-#ifdef ENABLE_CLIENT_CR
+#ifdef ENABLE_MANAGEMENT
             struct buffer buf = *buffer;
             if (buf_string_match_head_str(&buf, "AUTH_FAILED,CRV1:") && BLEN(&buf))
             {
@@ -274,11 +289,18 @@ incoming_push_message(struct context *c, const struct buffer *buffer)
     {
         if (c->options.mode == MODE_SERVER)
         {
+            struct frame *frame_fragment = NULL;
+#ifdef ENABLE_FRAGMENT
+            if (c->options.ce.fragment)
+            {
+                frame_fragment = &c->c2.frame_fragment;
+            }
+#endif
             struct tls_session *session = &c->c2.tls_multi->session[TM_ACTIVE];
             /* Do not regenerate keys if client send a second push request */
             if (!session->key[KS_PRIMARY].crypto_options.key_ctx_bi.initialized
                 && !tls_session_update_crypto_params(session, &c->options,
-                                                     &c->c2.frame))
+                                                     &c->c2.frame, frame_fragment))
             {
                 msg(D_TLS_ERRORS, "TLS Error: initializing data channel failed");
                 goto error;
@@ -311,6 +333,37 @@ send_push_request(struct context *c)
 }
 
 #if P2MP_SERVER
+/**
+ * Prepare push option for auth-token
+ * @param tls_multi     tls multi context of VPN tunnel
+ * @param gc            gc arena for allocating push options
+ * @param push_list     push list to where options are added
+ *
+ * @return true on success, false on failure.
+ */
+void
+prepare_auth_token_push_reply(struct tls_multi *tls_multi, struct gc_arena *gc,
+                              struct push_list *push_list)
+{
+    /*
+     * If server uses --auth-gen-token and we have an auth token
+     * to send to the client
+     */
+    if (tls_multi->auth_token)
+    {
+        push_option_fmt(gc, push_list, M_USAGE,
+                        "auth-token %s",
+                        tls_multi->auth_token);
+        if (!tls_multi->auth_token_initial)
+        {
+            /*
+             * Save the initial auth token for clients that ignore
+             * the updates to the token
+             */
+            tls_multi->auth_token_initial = strdup(tls_multi->auth_token);
+        }
+    }
+}
 
 /**
  * Prepare push options, based on local options and available peer info.
@@ -321,7 +374,7 @@ send_push_request(struct context *c)
  *
  * @return true on success, false on failure.
  */
-static bool
+bool
 prepare_push_reply(struct context *c, struct gc_arena *gc,
                    struct push_list *push_list)
 {
@@ -342,7 +395,8 @@ prepare_push_reply(struct context *c, struct gc_arena *gc,
 
     /* ipv4 */
     if (c->c2.push_ifconfig_defined && c->c2.push_ifconfig_local
-        && c->c2.push_ifconfig_remote_netmask)
+        && c->c2.push_ifconfig_remote_netmask
+        && !o->push_ifconfig_ipv4_blocked)
     {
         in_addr_t ifconfig_local = c->c2.push_ifconfig_local;
         if (c->c2.push_ifconfig_local_alias)
@@ -368,6 +422,11 @@ prepare_push_reply(struct context *c, struct gc_arena *gc,
             tls_multi->use_peer_id = true;
         }
     }
+    /*
+     * If server uses --auth-gen-token and we have an auth token
+     * to send to the client
+     */
+    prepare_auth_token_push_reply(tls_multi, gc, push_list);
 
     /* Push cipher if client supports Negotiable Crypto Parameters */
     if (tls_peer_info_ncp_ver(peer_info) >= 2 && o->ncp_enabled)
@@ -398,15 +457,6 @@ prepare_push_reply(struct context *c, struct gc_arena *gc,
         tls_poor_mans_ncp(o, tls_multi->remote_ciphername);
     }
 
-    /* If server uses --auth-gen-token and we have an auth token
-     * to send to the client
-     */
-    if (false == tls_multi->auth_token_sent && NULL != tls_multi->auth_token)
-    {
-        push_option_fmt(gc, push_list, M_USAGE,
-                        "auth-token %s", tls_multi->auth_token);
-        tls_multi->auth_token_sent = true;
-    }
     return true;
 }
 
@@ -417,6 +467,7 @@ send_push_options(struct context *c, struct buffer *buf,
 {
     struct push_entry *e = push_list->head;
 
+    e = push_list->head;
     while (e)
     {
         if (e->enable)
@@ -449,7 +500,26 @@ send_push_options(struct context *c, struct buffer *buf,
     return true;
 }
 
-static bool
+void
+send_push_reply_auth_token(struct tls_multi *multi)
+{
+    struct gc_arena gc = gc_new();
+    struct push_list push_list = { 0 };
+
+    prepare_auth_token_push_reply(multi, &gc, &push_list);
+
+    /* prepare auth token should always add the auth-token option */
+    struct push_entry *e = push_list.head;
+    ASSERT(e && e->enable);
+
+    /* Construct a mimimal control channel push reply message */
+    struct buffer buf = alloc_buf_gc(PUSH_BUNDLE_SIZE, &gc);
+    buf_printf(&buf, "%s, %s", push_reply_cmd, e->option);
+    send_control_channel_string_dowork(multi, BSTR(&buf), D_PUSH);
+    gc_free(&gc);
+}
+
+bool
 send_push_reply(struct context *c, struct push_list *per_client_push_list)
 {
     struct gc_arena gc = gc_new();
@@ -602,6 +672,13 @@ push_remove_option(struct options *o, const char *p)
 {
     msg(D_PUSH_DEBUG, "PUSH_REMOVE searching for: '%s'", p);
 
+    /* ifconfig is special, as not part of the push list */
+    if (streq(p, "ifconfig"))
+    {
+        o->push_ifconfig_ipv4_blocked = true;
+        return;
+    }
+
     /* ifconfig-ipv6 is special, as not part of the push list */
     if (streq( p, "ifconfig-ipv6" ))
     {
@@ -656,10 +733,9 @@ process_incoming_push_request(struct context *c)
         else
         {
             /* per-client push options - peer-id, cipher, ifconfig, ipv6-ifconfig */
-            struct push_list push_list;
+            struct push_list push_list = { 0 };
             struct gc_arena gc = gc_new();
 
-            CLEAR(push_list);
             if (prepare_push_reply(c, &gc, &push_list)
                 && send_push_reply(c, &push_list))
             {

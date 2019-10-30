@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -354,7 +354,7 @@ get_proxy_authenticate(socket_descriptor_t sd,
 #if NTLM
             else if (!strncmp(buf+20, "NTLM", 4))
             {
-                msg(D_PROXY, "PROXY AUTH HTLM: '%s'", buf);
+                msg(D_PROXY, "PROXY AUTH NTLM: '%s'", buf);
                 *data = NULL;
                 ret = HTTP_AUTH_NTLM;
             }
@@ -884,10 +884,10 @@ establish_http_proxy_passthru(struct http_proxy_info *p,
                 const char *algor = get_pa_var("algorithm", pa, &gc);
                 const char *opaque = get_pa_var("opaque", pa, &gc);
 
-                if ( !realm || !nonce )
+                if (!realm || !nonce)
                 {
                     msg(D_LINK_ERRORS, "HTTP proxy: digest auth failed, malformed response "
-                            "from server: realm= or nonce= missing" );
+                        "from server: realm= or nonce= missing" );
                     goto error;
                 }
 

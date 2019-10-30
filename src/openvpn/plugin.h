@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -206,5 +206,7 @@ plugin_call(const struct plugin_list *pl,
 {
     return plugin_call_ssl(pl, type, av, pr, es, -1, NULL);
 }
+
+void plugin_abort(void);
 
 #endif /* OPENVPN_PLUGIN_H */

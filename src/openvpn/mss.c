@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -110,7 +110,7 @@ mss_fixup_ipv6(struct buffer *buf, int maxmss)
      * before the final header (TCP, UDP, ...), so we'd need to walk that
      * chain (see RFC 2460 and RFC 6564 for details).
      *
-     * In practice, "most typically used" extention headers (AH, routing,
+     * In practice, "most typically used" extension headers (AH, routing,
      * fragment, mobility) are very unlikely to be seen inside an OpenVPN
      * tun, so for now, we only handle the case of "single next header = TCP"
      */
@@ -150,7 +150,7 @@ mss_fixup_dowork(struct buffer *buf, uint16_t maxmss)
 
     if (BLEN(buf) < (int) sizeof(struct openvpn_tcphdr))
     {
-	return;
+        return;
     }
 
     verify_align_4(buf);

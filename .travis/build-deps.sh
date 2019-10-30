@@ -111,7 +111,7 @@ build_openssl_mingw () {
         fi
 
         ./Configure --cross-compile-prefix=${CHOST}- shared \
-           ${TARGET} no-multilib no-capieng --prefix="${PREFIX}" --openssldir="${PREFIX}" -static-libgcc
+           ${TARGET} no-capieng --prefix="${PREFIX}" --openssldir="${PREFIX}" -static-libgcc
         make install
     )
 }
@@ -129,15 +129,6 @@ build_openssl () {
         echo "${OPENSSL_VERSION}" > "${PREFIX}/.openssl-version"
     fi
 }
-
-if [ ! -z ${CHOST+x} ]; then
-      #
-      # openvpn requires at least mingw-gcc-4.9, which is available at xenial repo
-      #
-      sudo apt-add-repository "deb http://archive.ubuntu.com/ubuntu xenial main universe"
-      sudo apt-get update
-      sudo apt-get -y install dpkg mingw-w64
-fi
 
 # Download and build crypto lib
 if [ "${SSLLIB}" = "openssl" ]; then

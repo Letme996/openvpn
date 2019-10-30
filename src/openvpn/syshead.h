@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -47,6 +47,7 @@
 #ifdef _MSC_VER /* Visual Studio */
 #define __func__ __FUNCTION__
 #define __attribute__(x)
+#include <inttypes.h>
 #endif
 
 #if defined(__APPLE__)
@@ -178,8 +179,8 @@
 #include <resolv.h>
 #endif
 
-#ifdef HAVE_SYS_POLL_H
-#include <sys/poll.h>
+#ifdef HAVE_POLL_H
+#include <poll.h>
 #endif
 
 #ifdef HAVE_SYS_EPOLL_H
@@ -547,25 +548,10 @@ socket_defined(const socket_descriptor_t sd)
 #undef ENABLE_DEF_AUTH
 #endif
 
-/*
- * Enable external private key
- */
-#if defined(ENABLE_MANAGEMENT)
-#define MANAGMENT_EXTERNAL_KEY
-#endif
-
 /* Enable mbed TLS RNG prediction resistance support */
 #ifdef ENABLE_CRYPTO_MBEDTLS
 #define ENABLE_PREDICTION_RESISTANCE
 #endif /* ENABLE_CRYPTO_MBEDTLS */
-
-/*
- * MANAGEMENT_IN_EXTRA allows the management interface to
- * read multi-line inputs from clients.
- */
-#if defined(MANAGEMENT_DEF_AUTH) || defined(MANAGMENT_EXTERNAL_KEY)
-#define MANAGEMENT_IN_EXTRA
-#endif
 
 /*
  * Enable packet filter?
@@ -614,7 +600,7 @@ socket_defined(const socket_descriptor_t sd)
 /*
  * Is poll available on this platform?
  */
-#if defined(HAVE_POLL) && defined(HAVE_SYS_POLL_H)
+#if defined(HAVE_POLL) && defined(HAVE_POLL_H)
 #define POLL 1
 #else
 #define POLL 0
@@ -655,22 +641,6 @@ socket_defined(const socket_descriptor_t sd)
  */
 #if defined(HAVE_GETSOCKOPT) && defined(SOL_SOCKET) && defined(SO_ERROR) && defined(EINPROGRESS) && defined(ETIMEDOUT)
 #define CONNECT_NONBLOCK
-#endif
-
-/*
- * Do we have the capability to support the AUTO_USERID feature?
- */
-#if defined(ENABLE_AUTO_USERID)
-#define AUTO_USERID 1
-#else
-#define AUTO_USERID 0
-#endif
-
-/*
- * Do we support challenge/response authentication as client?
- */
-#if defined(ENABLE_MANAGEMENT)
-#define ENABLE_CLIENT_CR
 #endif
 
 /*

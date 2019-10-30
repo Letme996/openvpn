@@ -5,8 +5,8 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
- *  Copyright (C) 2013-2017 Gert Doering <gert@greenie.muc.de>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2013-2018 Gert Doering <gert@greenie.muc.de>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -35,7 +35,7 @@
 #if defined(NEED_COMPAT_LZ4)
 #include "compat-lz4.h"
 #else
-#include "lz4.h"
+#include <lz4.h>
 #endif
 
 #include "comp.h"

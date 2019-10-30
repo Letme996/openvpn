@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -36,12 +36,8 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <process.h>
-
-/* bool definitions */
-#define bool int
-#define true 1
-#define false 0
 
 static SERVICE_STATUS_HANDLE service;
 static SERVICE_STATUS status = { .dwServiceType = SERVICE_WIN32_SHARE_PROCESS };
@@ -135,7 +131,7 @@ match(const WIN32_FIND_DATA *find, LPCTSTR ext)
  * Modify the extension on a filename.
  */
 static bool
-modext(LPTSTR dest, int size, LPCTSTR src, LPCTSTR newext)
+modext(LPTSTR dest, size_t size, LPCTSTR src, LPCTSTR newext)
 {
     size_t i;
 

@@ -1,24 +1,21 @@
 sudo: required
-dist: trusty
+dist: xenial
 
 os: linux
 
 language: c
 
-compiler:
-  - gcc
-
 env:
   global:
     - JOBS=3
     - PREFIX="${HOME}/opt"
-    - TAP_WINDOWS_VERSION=9.21.2
+    - TAP_WINDOWS_VERSION=9.23.3
     - LZO_VERSION=2.10
-    - PKCS11_HELPER_VERSION=1.22
-    - MBEDTLS_VERSION="2.5.1"
+    - PKCS11_HELPER_VERSION=1.25.1
+    - MBEDTLS_VERSION=2.16.1
     - MBEDTLS_CFLAGS="-I${PREFIX}/include"
     - MBEDTLS_LIBS="-L${PREFIX}/lib -lmbedtls -lmbedx509 -lmbedcrypto"
-    - OPENSSL_VERSION="1.0.2l"
+    - OPENSSL_VERSION=1.0.2s
     - OPENSSL_CFLAGS="-I${PREFIX}/include"
     - OPENSSL_LIBS="-L${PREFIX}/lib -lssl -lcrypto"
     # The next declaration is the encrypted COVERITY_SCAN_TOKEN, created
@@ -30,13 +27,22 @@ matrix:
     - env: SSLLIB="openssl" RUN_COVERITY="1"
       os: linux
       compiler: gcc
-    - env: SSLLIB="openssl" OPENSSL_VERSION="1.1.0f"
+    - env: SSLLIB="openssl" OPENSSL_VERSION="1.0.1u"
+      os: linux
+      compiler: gcc
+    - env: SSLLIB="openssl" OPENSSL_VERSION="1.1.1c"
+      os: linux
+      compiler: gcc
+    - env: SSLLIB="openssl" OPENSSL_VERSION="1.1.1c" LABEL="linux-ppc64le"
+      os: linux-ppc64le
+      compiler: gcc
+    - env: SSLLIB="openssl" EXTRA_CONFIG="--enable-iproute2"
       os: linux
       compiler: gcc
     - env: SSLLIB="openssl" CFLAGS="-fsanitize=address"
       os: linux
       compiler: clang
-    - env: SSLLIB="openssl" OPENSSL_VERSION="1.1.0f"
+    - env: SSLLIB="openssl" OPENSSL_VERSION="1.1.1c"
       os: linux
       compiler: clang
     - env: SSLLIB="mbedtls"
@@ -47,13 +53,14 @@ matrix:
       compiler: clang
     - env: SSLLIB="openssl"
       os: osx
-      osx_image: xcode7.3
       compiler: clang
     - env: SSLLIB="mbedtls"
       os: osx
-      osx_image: xcode7.3
       compiler: clang
-    - env: SSLLIB="openssl" CHOST=x86_64-w64-mingw32
+    - env: SSLLIB="openssl" CHOST=x86_64-w64-mingw32 OPENSSL_VERSION="1.0.1u"
+      os: linux
+      compiler: ": Win64 build only"
+    - env: SSLLIB="openssl" CHOST=x86_64-w64-mingw32 OPENSSL_VERSION="1.1.1c"
       os: linux
       compiler: ": Win64 build only"
     - env: SSLLIB="openssl" CHOST=i686-w64-mingw32
@@ -65,27 +72,20 @@ matrix:
     - env: SSLLIB="openssl" EXTRA_CONFIG="--enable-small"
       os: linux
       compiler: clang
-  exclude:
-    - compiler: gcc
 
 addons:
   apt:
-    packages:
-      - liblzo2-dev
-      - libpam0g-dev
-      - liblz4-dev
-      - linux-libc-dev
-      - man2html
+    update: true
+    packages: [ liblzo2-dev, libpam0g-dev, liblz4-dev, linux-libc-dev, man2html, mingw-w64]
+  homebrew:
+    update: true
+    packages: [ lzo ]
 
 cache:
   directories:
   - download-cache
   - ${HOME}/opt
   - ${HOME}/Library/Caches/Homebrew
-
-before_install:
-  - if [ "${TRAVIS_OS_NAME}" = "osx" ]; then brew update     ; fi
-  - if [ "${TRAVIS_OS_NAME}" = "osx" ]; then brew install lzo; fi
 
 install:
   - if [ ! -z "${CHOST}" ]; then unset CC; fi

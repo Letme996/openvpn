@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -258,12 +258,12 @@ bool packet_id_read(struct packet_id_net *pin, struct buffer *buf, bool long_for
  * @param p             Packet ID state.
  * @param buf           Buffer to write the packet ID too
  * @param long_form     If true, also update and write time_t to buf
- * @param prepend       If true, prepend to buffer, otherwise apppend.
+ * @param prepend       If true, prepend to buffer, otherwise append.
  *
  * @return true if successful, false otherwise.
  */
 bool packet_id_write(struct packet_id_send *p, struct buffer *buf,
-        bool long_form, bool prepend);
+                     bool long_form, bool prepend);
 
 /*
  * Inline functions.

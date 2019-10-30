@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -31,6 +31,7 @@
 
 #include "error.h"
 #include "buffer.h"
+#include "init.h"
 #include "misc.h"
 #include "win32.h"
 #include "socket.h"
@@ -342,8 +343,8 @@ x_msg_va(const unsigned int flags, const char *format, va_list arglist)
                 struct timeval tv;
                 gettimeofday(&tv, NULL);
 
-                fprintf(fp, "%lld.%06ld %x %s%s%s%s",
-                        (long long)tv.tv_sec,
+                fprintf(fp, "%" PRIi64 ".%06ld %x %s%s%s%s",
+                        (int64_t)tv.tv_sec,
                         (long)tv.tv_usec,
                         flags,
                         prefix,
@@ -734,13 +735,6 @@ openvpn_exit(const int status)
 {
     if (!forked)
     {
-        void tun_abort();
-
-#ifdef ENABLE_PLUGIN
-        void plugin_abort(void);
-
-#endif
-
         tun_abort();
 
 #ifdef _WIN32

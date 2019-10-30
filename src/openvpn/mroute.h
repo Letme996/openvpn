@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -170,6 +170,16 @@ void mroute_helper_add_iroute46(struct mroute_helper *mh, int netbits);
 
 void mroute_helper_del_iroute46(struct mroute_helper *mh, int netbits);
 
+unsigned int mroute_extract_addr_ip(struct mroute_addr *src,
+                                    struct mroute_addr *dest,
+                                    const struct buffer *buf);
+
+unsigned int mroute_extract_addr_ether(struct mroute_addr *src,
+                                       struct mroute_addr *dest,
+                                       struct mroute_addr *esrc,
+                                       struct mroute_addr *edest,
+                                       const struct buffer *buf);
+
 /*
  * Given a raw packet in buf, return the src and dest
  * addresses of the packet.
@@ -182,16 +192,6 @@ mroute_extract_addr_from_packet(struct mroute_addr *src,
                                 const struct buffer *buf,
                                 int tunnel_type)
 {
-    unsigned int mroute_extract_addr_ip(struct mroute_addr *src,
-                                     struct mroute_addr *dest,
-                                     const struct buffer *buf);
-
-    unsigned int mroute_extract_addr_ether(struct mroute_addr *src,
-                                           struct mroute_addr *dest,
-                                           struct mroute_addr *esrc,
-                                           struct mroute_addr *edest,
-                                           const struct buffer *buf);
-
     unsigned int ret = 0;
     verify_align_4(buf);
     if (tunnel_type == DEV_TYPE_TUN)

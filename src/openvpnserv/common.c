@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2011-2017 Heiko Hund <heiko.hund@sophos.com>
+ *  Copyright (C) 2011-2018 Heiko Hund <heiko.hund@sophos.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -25,13 +25,13 @@
 #include "validate.h"
 
 LPCTSTR service_instance = TEXT("");
-
+static wchar_t win_sys_path[MAX_PATH];
 
 /*
  * These are necessary due to certain buggy implementations of (v)snprintf,
  * that don't guarantee null termination for size > 0.
  */
-int
+BOOL
 openvpn_vsntprintf(LPTSTR str, size_t size, LPCTSTR format, va_list arglist)
 {
     int len = -1;
@@ -40,31 +40,51 @@ openvpn_vsntprintf(LPTSTR str, size_t size, LPCTSTR format, va_list arglist)
         len = _vsntprintf(str, size, format, arglist);
         str[size - 1] = 0;
     }
-    return (len >= 0 && len < size);
+    return (len >= 0 && (size_t)len < size);
 }
-int
+
+BOOL
 openvpn_sntprintf(LPTSTR str, size_t size, LPCTSTR format, ...)
+{
+    va_list arglist;
+    BOOL res = FALSE;
+    if (size > 0)
+    {
+        va_start(arglist, format);
+        res = openvpn_vsntprintf(str, size, format, arglist);
+        va_end(arglist);
+    }
+    return res;
+}
+
+BOOL
+openvpn_swprintf(wchar_t *const str, const size_t size, const wchar_t *const format, ...)
 {
     va_list arglist;
     int len = -1;
     if (size > 0)
     {
         va_start(arglist, format);
-        len = openvpn_vsntprintf(str, size, format, arglist);
+        len = vswprintf(str, size, format, arglist);
         va_end(arglist);
+        str[size - 1] = L'\0';
     }
-    return len;
+    return (len >= 0 && len < size);
 }
 
 static DWORD
-GetRegString(HKEY key, LPCTSTR value, LPTSTR data, DWORD size)
+GetRegString(HKEY key, LPCTSTR value, LPTSTR data, DWORD size, LPCTSTR default_value)
 {
-    DWORD type;
-    LONG status = RegQueryValueEx(key, value, NULL, &type, (LPBYTE) data, &size);
+    LONG status = RegGetValue(key, NULL, value, RRF_RT_REG_SZ,
+                              NULL, (LPBYTE) data, &size);
 
-    if (status == ERROR_SUCCESS && type != REG_SZ)
+    if (status == ERROR_FILE_NOT_FOUND && default_value)
     {
-        status = ERROR_DATATYPE_MISMATCH;
+        size_t len = size/sizeof(data[0]);
+        if (openvpn_sntprintf(data, len, default_value))
+        {
+            status = ERROR_SUCCESS;
+        }
     }
 
     if (status != ERROR_SUCCESS)
@@ -85,6 +105,8 @@ GetOpenvpnSettings(settings_t *s)
     TCHAR append[2];
     DWORD error;
     HKEY key;
+    TCHAR install_path[MAX_PATH];
+    TCHAR default_value[MAX_PATH];
 
     openvpn_sntprintf(reg_path, _countof(reg_path), TEXT("SOFTWARE\\" PACKAGE_NAME "%s"), service_instance);
 
@@ -95,48 +117,61 @@ GetOpenvpnSettings(settings_t *s)
         return MsgToEventLog(M_SYSERR, TEXT("Could not open Registry key HKLM\\%s not found"), reg_path);
     }
 
-    error = GetRegString(key, TEXT("exe_path"), s->exe_path, sizeof(s->exe_path));
+    /* The default value of REG_KEY is the install path */
+    if (GetRegString(key, NULL, install_path, sizeof(install_path), NULL) != ERROR_SUCCESS)
+    {
+        goto out;
+    }
+
+    openvpn_sntprintf(default_value, _countof(default_value), TEXT("%s\\bin\\openvpn.exe"),
+                      install_path);
+    error = GetRegString(key, TEXT("exe_path"), s->exe_path, sizeof(s->exe_path), default_value);
     if (error != ERROR_SUCCESS)
     {
         goto out;
     }
 
-    error = GetRegString(key, TEXT("config_dir"), s->config_dir, sizeof(s->config_dir));
+    openvpn_sntprintf(default_value, _countof(default_value), TEXT("%s\\config"), install_path);
+    error = GetRegString(key, TEXT("config_dir"), s->config_dir, sizeof(s->config_dir),
+                         default_value);
     if (error != ERROR_SUCCESS)
     {
         goto out;
     }
 
-    error = GetRegString(key, TEXT("config_ext"), s->ext_string, sizeof(s->ext_string));
+    error = GetRegString(key, TEXT("config_ext"), s->ext_string, sizeof(s->ext_string),
+                         TEXT(".ovpn"));
     if (error != ERROR_SUCCESS)
     {
         goto out;
     }
 
-    error = GetRegString(key, TEXT("log_dir"), s->log_dir, sizeof(s->log_dir));
+    openvpn_sntprintf(default_value, _countof(default_value), TEXT("%s\\log"), install_path);
+    error = GetRegString(key, TEXT("log_dir"), s->log_dir, sizeof(s->log_dir), default_value);
     if (error != ERROR_SUCCESS)
     {
         goto out;
     }
 
-    error = GetRegString(key, TEXT("priority"), priority, sizeof(priority));
+    error = GetRegString(key, TEXT("priority"), priority, sizeof(priority),
+                         TEXT("NORMAL_PRIORITY_CLASS"));
     if (error != ERROR_SUCCESS)
     {
         goto out;
     }
 
-    error = GetRegString(key, TEXT("log_append"), append, sizeof(append));
+    error = GetRegString(key, TEXT("log_append"), append, sizeof(append), TEXT("0"));
     if (error != ERROR_SUCCESS)
     {
         goto out;
     }
 
     /* read if present, else use default */
-    error = GetRegString(key, TEXT("ovpn_admin_group"), s->ovpn_admin_group, sizeof(s->ovpn_admin_group));
+    error = GetRegString(key, TEXT("ovpn_admin_group"), s->ovpn_admin_group,
+                         sizeof(s->ovpn_admin_group), OVPN_ADMIN_GROUP);
     if (error != ERROR_SUCCESS)
     {
-        openvpn_sntprintf(s->ovpn_admin_group, _countof(s->ovpn_admin_group), OVPN_ADMIN_GROUP);
-        error = 0; /* this error is not fatal */
+        goto out;
     }
     /* set process priority */
     if (!_tcsicmp(priority, TEXT("IDLE_PRIORITY_CLASS")))
@@ -265,4 +300,18 @@ utf8to16(const char *utf8)
     }
     MultiByteToWideChar(CP_UTF8, 0, utf8, -1, utf16, n);
     return utf16;
+}
+
+const wchar_t *
+get_win_sys_path(void)
+{
+    const wchar_t *default_sys_path = L"C:\\Windows\\system32";
+
+    if (!GetSystemDirectoryW(win_sys_path, _countof(win_sys_path)))
+    {
+        wcsncpy(win_sys_path, default_sys_path, _countof(win_sys_path));
+        win_sys_path[_countof(win_sys_path) - 1] = L'\0';
+    }
+
+    return win_sys_path;
 }

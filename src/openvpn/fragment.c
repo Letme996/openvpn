@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -31,6 +31,7 @@
 
 #ifdef ENABLE_FRAGMENT
 
+#include "crypto.h"
 #include "misc.h"
 #include "fragment.h"
 #include "integer.h"
@@ -177,7 +178,7 @@ fragment_incoming(struct fragment_master *f, struct buffer *buf,
 
             if (flags & (FRAG_SEQ_ID_MASK | FRAG_ID_MASK))
             {
-                FRAG_ERR("spurrious FRAG_WHOLE flags");
+                FRAG_ERR("spurious FRAG_WHOLE flags");
             }
         }
         else if (frag_type == FRAG_YES_NOTLAST || frag_type == FRAG_YES_LAST)

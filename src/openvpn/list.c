@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -220,18 +220,6 @@ hash_remove_marked(struct hash *hash, struct hash_bucket *bucket)
             he = he->next;
         }
     }
-}
-
-uint32_t
-void_ptr_hash_function(const void *key, uint32_t iv)
-{
-    return hash_func((const void *)&key, sizeof(key), iv);
-}
-
-bool
-void_ptr_compare_function(const void *key1, const void *key2)
-{
-    return key1 == key2;
 }
 
 void

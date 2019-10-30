@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -37,6 +37,8 @@
 
 #include "memdbg.h"
 
+#include <wchar.h>
+
 size_t
 array_mult_safe(const size_t m1, const size_t m2, const size_t extra)
 {
@@ -44,7 +46,7 @@ array_mult_safe(const size_t m1, const size_t m2, const size_t extra)
     unsigned long long res = (unsigned long long)m1 * (unsigned long long)m2 + (unsigned long long)extra;
     if (unlikely(m1 > limit) || unlikely(m2 > limit) || unlikely(extra > limit) || unlikely(res > (unsigned long long)limit))
     {
-        msg(M_FATAL, "attemped allocation of excessively large array");
+        msg(M_FATAL, "attempted allocation of excessively large array");
     }
     return (size_t) res;
 }
@@ -189,6 +191,34 @@ free_buf(struct buffer *buf)
     CLEAR(*buf);
 }
 
+static void
+free_buf_gc(struct buffer *buf, struct gc_arena *gc)
+{
+    if (gc)
+    {
+        struct gc_entry **e = &gc->list;
+
+        while (*e)
+        {
+            /* check if this object is the one we want to delete */
+            if ((uint8_t *)(*e + 1) == buf->data)
+            {
+                struct gc_entry *to_delete = *e;
+
+                /* remove element from linked list and free it */
+                *e = (*e)->next;
+                free(to_delete);
+
+                break;
+            }
+
+            e = &(*e)->next;
+        }
+    }
+
+    CLEAR(*buf);
+}
+
 /*
  * Return a buffer for write that is a subset of another buffer
  */
@@ -281,6 +311,29 @@ openvpn_snprintf(char *str, size_t size, const char *format, ...)
 }
 
 /*
+ * openvpn_swprintf() is currently only used by Windows code paths
+ * and when enabled for all platforms it will currently break older
+ * OpenBSD versions lacking vswprintf(3) support in their libc.
+ */
+
+#ifdef _WIN32
+bool
+openvpn_swprintf(wchar_t *const str, const size_t size, const wchar_t *const format, ...)
+{
+    va_list arglist;
+    int len = -1;
+    if (size > 0)
+    {
+        va_start(arglist, format);
+        len = vswprintf(str, size, format, arglist);
+        va_end(arglist);
+        str[size - 1] = L'\0';
+    }
+    return (len >= 0 && len < size);
+}
+#endif
+
+/*
  * write a string to the end of a buffer that was
  * truncated by buf_printf
  */
@@ -315,16 +368,33 @@ convert_to_one_line(struct buffer *buf)
     }
 }
 
-/* NOTE: requires that string be null terminated */
-void
-buf_write_string_file(const struct buffer *buf, const char *filename, int fd)
+bool
+buffer_write_file(const char *filename, const struct buffer *buf)
 {
-    const int len = strlen((char *) BPTR(buf));
-    const int size = write(fd, BPTR(buf), len);
-    if (size != len)
+    bool ret = false;
+    int fd = platform_open(filename, O_CREAT | O_TRUNC | O_WRONLY,
+                           S_IRUSR | S_IWUSR);
+    if (fd == -1)
     {
-        msg(M_ERR, "Write error on file '%s'", filename);
+        msg(M_ERRNO, "Cannot open file '%s' for write", filename);
+        return false;
     }
+
+    const int size = write(fd, BPTR(buf), BLEN(buf));
+    if (size != BLEN(buf))
+    {
+        msg(M_ERRNO, "Write error on file '%s'", filename);
+        goto cleanup;
+    }
+
+    ret = true;
+cleanup:
+    if (close(fd) < 0)
+    {
+        msg(M_ERRNO, "Close error on file %s", filename);
+        ret = false;
+    }
+    return ret;
 }
 
 /*
@@ -404,7 +474,7 @@ x_gc_freespecial(struct gc_arena *a)
 }
 
 void
-gc_addspecial(void *addr, void(free_function)(void *), struct gc_arena *a)
+gc_addspecial(void *addr, void (free_function)(void *), struct gc_arena *a)
 {
     ASSERT(a);
     struct gc_entry_special *e;
@@ -1226,49 +1296,44 @@ void
 buffer_list_aggregate_separator(struct buffer_list *bl, const size_t max_len,
                                 const char *sep)
 {
-    int sep_len = strlen(sep);
-
-    if (bl->head)
+    const int sep_len = strlen(sep);
+    struct buffer_entry *more = bl->head;
+    size_t size = 0;
+    int count = 0;
+    for (count = 0; more; ++count)
     {
-        struct buffer_entry *more = bl->head;
-        size_t size = 0;
-        int count = 0;
-        for (count = 0; more; ++count)
+        size_t extra_len = BLEN(&more->buf) + sep_len;
+        if (size + extra_len > max_len)
         {
-            size_t extra_len = BLEN(&more->buf) + sep_len;
-            if (size + extra_len > max_len)
-            {
-                break;
-            }
-
-            size += extra_len;
-            more = more->next;
+            break;
         }
 
-        if (count >= 2)
-        {
-            int i;
-            struct buffer_entry *e = bl->head, *f;
+        size += extra_len;
+        more = more->next;
+    }
 
-            ALLOC_OBJ_CLEAR(f, struct buffer_entry);
-            f->buf = alloc_buf(size + 1); /* prevent 0-byte malloc */
-            f->buf.capacity = size;
-            for (i = 0; e && i < count; ++i)
-            {
-                struct buffer_entry *next = e->next;
-                buf_copy(&f->buf, &e->buf);
-                buf_write(&f->buf, sep, sep_len);
-                free_buf(&e->buf);
-                free(e);
-                e = next;
-            }
-            bl->head = f;
-            bl->size -= count - 1;
-            f->next = more;
-            if (!more)
-            {
-                bl->tail = f;
-            }
+    if (count >= 2)
+    {
+        struct buffer_entry *f;
+        ALLOC_OBJ_CLEAR(f, struct buffer_entry);
+        f->buf = alloc_buf(size + 1); /* prevent 0-byte malloc */
+
+        struct buffer_entry *e = bl->head;
+        for (size_t i = 0; e && i < count; ++i)
+        {
+            struct buffer_entry *next = e->next;
+            buf_copy(&f->buf, &e->buf);
+            buf_write(&f->buf, sep, sep_len);
+            free_buf(&e->buf);
+            free(e);
+            e = next;
+        }
+        bl->head = f;
+        bl->size -= count - 1;
+        f->next = more;
+        if (!more)
+        {
+            bl->tail = f;
         }
     }
 }
@@ -1331,4 +1396,37 @@ buffer_list_file(const char *fn, int max_line_len)
         fclose(fp);
     }
     return bl;
+}
+
+struct buffer
+buffer_read_from_file(const char *filename, struct gc_arena *gc)
+{
+    struct buffer ret = { 0 };
+
+    platform_stat_t file_stat = {0};
+    if (platform_stat(filename, &file_stat) < 0)
+    {
+        return ret;
+    }
+
+    FILE *fp = platform_fopen(filename, "r");
+    if (!fp)
+    {
+        return ret;
+    }
+
+    const size_t size = file_stat.st_size;
+    ret = alloc_buf_gc(size + 1, gc); /* space for trailing \0 */
+    ssize_t read_size = fread(BPTR(&ret), 1, size, fp);
+    if (read_size < 0)
+    {
+        free_buf_gc(&ret, gc);
+        goto cleanup;
+    }
+    ASSERT(buf_inc_len(&ret, read_size));
+    buf_null_terminate(&ret);
+
+cleanup:
+    fclose(fp);
+    return ret;
 }

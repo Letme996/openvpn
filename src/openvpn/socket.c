@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -35,6 +35,7 @@
 #include "gremlin.h"
 #include "plugin.h"
 #include "ps.h"
+#include "run_command.h"
 #include "manage.h"
 #include "misc.h"
 #include "manage.h"
@@ -74,12 +75,120 @@ sf2gaf(const unsigned int getaddr_flags,
 /*
  * Functions related to the translation of DNS names to IP addresses.
  */
+static int
+get_addr_generic(sa_family_t af, unsigned int flags, const char *hostname,
+                 void *network, unsigned int *netbits,
+                 int resolve_retry_seconds, volatile int *signal_received,
+                 int msglevel)
+{
+    char *endp, *sep, *var_host = NULL;
+    struct addrinfo *ai = NULL;
+    unsigned long bits;
+    uint8_t max_bits;
+    int ret = -1;
 
-/*
- * Translate IP addr or hostname to in_addr_t.
- * If resolve error, try again for
- * resolve_retry_seconds seconds.
- */
+    if (!hostname)
+    {
+        msg(M_NONFATAL, "Can't resolve null hostname!");
+        goto out;
+    }
+
+    /* assign family specific default values */
+    switch (af)
+    {
+        case AF_INET:
+            bits = 0;
+            max_bits = sizeof(in_addr_t) * 8;
+            break;
+
+        case AF_INET6:
+            bits = 64;
+            max_bits = sizeof(struct in6_addr) * 8;
+            break;
+
+        default:
+            msg(M_WARN,
+                "Unsupported AF family passed to getaddrinfo for %s (%d)",
+                hostname, af);
+            goto out;
+    }
+
+    /* we need to modify the hostname received as input, but we don't want to
+     * touch it directly as it might be a constant string.
+     *
+     * Therefore, we clone the string here and free it at the end of the
+     * function */
+    var_host = strdup(hostname);
+    if (!var_host)
+    {
+        msg(M_NONFATAL | M_ERRNO,
+            "Can't allocate hostname buffer for getaddrinfo");
+        goto out;
+    }
+
+    /* check if this hostname has a /bits suffix */
+    sep = strchr(var_host, '/');
+    if (sep)
+    {
+        bits = strtoul(sep + 1, &endp, 10);
+        if ((*endp != '\0') || (bits > max_bits))
+        {
+            msg(msglevel, "IP prefix '%s': invalid '/bits' spec (%s)", hostname,
+                sep + 1);
+            goto out;
+        }
+        *sep = '\0';
+    }
+
+    ret = openvpn_getaddrinfo(flags & ~GETADDR_HOST_ORDER, var_host, NULL,
+                              resolve_retry_seconds, signal_received, af, &ai);
+    if ((ret == 0) && network)
+    {
+        struct in6_addr *ip6;
+        in_addr_t *ip4;
+
+        switch (af)
+        {
+            case AF_INET:
+                ip4 = network;
+                *ip4 = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
+
+                if (flags & GETADDR_HOST_ORDER)
+                {
+                    *ip4 = ntohl(*ip4);
+                }
+                break;
+
+            case AF_INET6:
+                ip6 = network;
+                *ip6 = ((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr;
+                break;
+
+            default:
+                /* can't get here because 'af' was previously checked */
+                msg(M_WARN,
+                    "Unsupported AF family for %s (%d)", var_host, af);
+                goto out;
+        }
+    }
+
+    if (netbits)
+    {
+        *netbits = bits;
+    }
+
+    /* restore '/' separator, if any */
+    if (sep)
+    {
+        *sep = '/';
+    }
+out:
+    freeaddrinfo(ai);
+    free(var_host);
+
+    return ret;
+}
+
 in_addr_t
 getaddr(unsigned int flags,
         const char *hostname,
@@ -87,20 +196,19 @@ getaddr(unsigned int flags,
         bool *succeeded,
         volatile int *signal_received)
 {
-    struct addrinfo *ai;
+    in_addr_t addr;
     int status;
-    status = openvpn_getaddrinfo(flags & ~GETADDR_HOST_ORDER, hostname, NULL,
-                                 resolve_retry_seconds, signal_received, AF_INET, &ai);
+
+    status = get_addr_generic(AF_INET, flags, hostname, &addr, NULL,
+                              resolve_retry_seconds, signal_received,
+                              M_WARN);
     if (status==0)
     {
-        struct in_addr ia;
         if (succeeded)
         {
             *succeeded = true;
         }
-        ia = ((struct sockaddr_in *)ai->ai_addr)->sin_addr;
-        freeaddrinfo(ai);
-        return (flags & GETADDR_HOST_ORDER) ? ntohl(ia.s_addr) : ia.s_addr;
+        return addr;
     }
     else
     {
@@ -110,6 +218,19 @@ getaddr(unsigned int flags,
         }
         return 0;
     }
+}
+
+bool
+get_ipv6_addr(const char *hostname, struct in6_addr *network,
+              unsigned int *netbits, int msglevel)
+{
+    if (get_addr_generic(AF_INET6, GETADDR_RESOLVE, hostname, network, netbits,
+                         0, NULL, msglevel) < 0)
+    {
+        return false;
+    }
+
+    return true;                /* parsing OK, values set */
 }
 
 static inline bool
@@ -871,7 +992,7 @@ link_socket_update_buffer_sizes(struct link_socket *ls, int rcvbuf, int sndbuf)
 }
 
 /*
- * SOCKET INITALIZATION CODE.
+ * SOCKET INITIALIZATION CODE.
  * Create a TCP/UDP socket
  */
 
@@ -1054,7 +1175,7 @@ socket_do_listen(socket_descriptor_t sd,
         ASSERT(local);
         msg(M_INFO, "Listening for incoming TCP connection on %s",
             print_sockaddr(local->ai_addr, &gc));
-        if (listen(sd, 1))
+        if (listen(sd, 32))
         {
             msg(M_ERR, "TCP: listen() failed");
         }
@@ -1122,7 +1243,7 @@ socket_do_accept(socket_descriptor_t sd,
 
     if (!socket_defined(new_sd))
     {
-        msg(D_LINK_ERRORS | M_ERRNO, "TCP: accept(%d) failed", sd);
+        msg(D_LINK_ERRORS | M_ERRNO, "TCP: accept(%d) failed", (int)sd);
     }
     /* only valid if we have remote_len_af!=0 */
     else if (remote_len_af && remote_len != remote_len_af)
@@ -1490,6 +1611,22 @@ socket_connect(socket_descriptor_t *sd,
 done:
     gc_free(&gc);
 }
+
+/*
+ * Stream buffer handling prototypes -- stream_buf is a helper class
+ * to assist in the packetization of stream transport protocols
+ * such as TCP.
+ */
+
+static void
+stream_buf_init(struct stream_buf *sb, struct buffer *buf,
+                const unsigned int sockflags, const int proto);
+
+static void
+stream_buf_close(struct stream_buf *sb);
+
+static bool
+stream_buf_added(struct stream_buf *sb, int length_added);
 
 /* For stream protocols, allocate a buffer to build up packet.
  * Called after frame has been finalized. */
@@ -1875,12 +2012,12 @@ phase2_inetd(struct link_socket *sock, const struct frame *frame,
                 sock->info.lsa->actual.dest.addr.sa.sa_family = local_addr.addr.sa.sa_family;
                 dmsg(D_SOCKET_DEBUG, "inetd(%s): using sa_family=%d from getsockname(%d)",
                      proto2ascii(sock->info.proto, sock->info.af, false),
-                     local_addr.addr.sa.sa_family, sock->sd);
+                     local_addr.addr.sa.sa_family, (int)sock->sd);
             }
             else
             {
                 msg(M_WARN, "inetd(%s): getsockname(%d) failed, using AF_INET",
-                    proto2ascii(sock->info.proto, sock->info.af, false), sock->sd);
+                    proto2ascii(sock->info.proto, sock->info.af, false), (int)sock->sd);
             }
         }
 #else  /* ifdef HAVE_GETSOCKNAME */
@@ -2398,7 +2535,7 @@ link_socket_current_remote(const struct link_socket_info *info)
  * by now just ignore it
  *
  * For --remote entries with multiple addresses this
- * only return the actual endpoint we have sucessfully connected to
+ * only return the actual endpoint we have successfully connected to
  */
     if (lsa->actual.dest.addr.sa.sa_family != AF_INET)
     {
@@ -2429,7 +2566,7 @@ link_socket_current_remote_ipv6(const struct link_socket_info *info)
  * for PF_INET6 routes over PF_INET6 endpoints
  *
  * For --remote entries with multiple addresses this
- * only return the actual endpoint we have sucessfully connected to
+ * only return the actual endpoint we have successfully connected to
  */
     if (lsa->actual.dest.addr.sa.sa_family != AF_INET6)
     {
@@ -2500,7 +2637,7 @@ stream_buf_reset(struct stream_buf *sb)
     sb->len = -1;
 }
 
-void
+static void
 stream_buf_init(struct stream_buf *sb,
                 struct buffer *buf,
                 const unsigned int sockflags,
@@ -2574,7 +2711,7 @@ stream_buf_read_setup_dowork(struct link_socket *sock)
     return !sock->stream_buf.residual_fully_formed;
 }
 
-bool
+static bool
 stream_buf_added(struct stream_buf *sb,
                  int length_added)
 {
@@ -2641,7 +2778,7 @@ stream_buf_added(struct stream_buf *sb,
     }
 }
 
-void
+static void
 stream_buf_close(struct stream_buf *sb)
 {
     free_buf(&sb->residual);
@@ -3142,7 +3279,7 @@ addr_family_name(int af)
  *
  * IPv6 and IPv4 protocols are comptabile but OpenVPN
  * has always sent UDPv4, TCPv4 over the wire. Keep these
- * strings for backward compatbility
+ * strings for backward compatibility
  */
 const char *
 proto_remote(int proto, bool remote)
@@ -3227,7 +3364,7 @@ link_socket_read_tcp(struct link_socket *sock,
 
 #if ENABLE_IP_PKTINFO
 
-/* make the buffer large enough to handle ancilliary socket data for
+/* make the buffer large enough to handle ancillary socket data for
  * both IPv4 and IPv6 destination addresses, plus padding (see RFC 2292)
  */
 #if defined(HAVE_IN_PKTINFO) && defined(HAVE_IPI_SPEC_DST)
@@ -3742,7 +3879,7 @@ socket_finalize(SOCKET s,
         if (ret >= 0 && io->addr_defined)
         {
             /* TODO(jjo): streamline this mess */
-            /* in this func we dont have relevant info about the PF_ of this
+            /* in this func we don't have relevant info about the PF_ of this
              * endpoint, as link_socket_actual will be zero for the 1st received packet
              *
              * Test for inets PF_ possible sizes

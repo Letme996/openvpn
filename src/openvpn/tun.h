@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -36,6 +36,7 @@
 #include "event.h"
 #include "proto.h"
 #include "misc.h"
+#include "networking.h"
 
 #if defined(_WIN32) || defined(TARGET_ANDROID)
 
@@ -138,7 +139,6 @@ struct tuntap
 
     bool did_ifconfig_setup;
     bool did_ifconfig_ipv6_setup;
-    bool did_ifconfig;
 
     bool persistent_if;         /* if existed before, keep on program end */
 
@@ -212,7 +212,7 @@ tuntap_defined(const struct tuntap *tt)
 void open_tun(const char *dev, const char *dev_type, const char *dev_node,
               struct tuntap *tt);
 
-void close_tun(struct tuntap *tt);
+void close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx);
 
 int write_tun(struct tuntap *tt, uint8_t *buf, int len);
 
@@ -220,7 +220,8 @@ int read_tun(struct tuntap *tt, uint8_t *buf, int len);
 
 void tuncfg(const char *dev, const char *dev_type, const char *dev_node,
             int persist_mode, const char *username,
-            const char *groupname, const struct tuntap_options *options);
+            const char *groupname, const struct tuntap_options *options,
+            openvpn_net_ctx_t *ctx);
 
 const char *guess_tuntap_dev(const char *dev,
                              const char *dev_type,
@@ -238,7 +239,8 @@ struct tuntap *init_tun(const char *dev,        /* --dev option */
                         struct addrinfo *local_public,
                         struct addrinfo *remote_public,
                         const bool strict_warn,
-                        struct env_set *es);
+                        struct env_set *es,
+                        openvpn_net_ctx_t *ctx);
 
 void init_tun_post(struct tuntap *tt,
                    const struct frame *frame,
@@ -247,10 +249,17 @@ void init_tun_post(struct tuntap *tt,
 void do_ifconfig_setenv(const struct tuntap *tt,
                         struct env_set *es);
 
-void do_ifconfig(struct tuntap *tt,
-                 const char *actual,     /* actual device name */
-                 int tun_mtu,
-                 const struct env_set *es);
+/**
+ * do_ifconfig - configure the tunnel interface
+ *
+ * @param tt        the tuntap interface context
+ * @param ifname    the human readable interface name
+ * @param mtu       the MTU value to set the interface to
+ * @param es        the environment to be used when executing the commands
+ * @param ctx       the networking API opaque context
+ */
+void do_ifconfig(struct tuntap *tt, const char *ifname, int tun_mtu,
+                 const struct env_set *es, openvpn_net_ctx_t *ctx);
 
 bool is_dev_type(const char *dev, const char *dev_type, const char *match_type);
 
@@ -266,7 +275,7 @@ void check_subnet_conflict(const in_addr_t ip,
                            const in_addr_t netmask,
                            const char *prefix);
 
-void warn_on_use_of_common_subnets(void);
+void warn_on_use_of_common_subnets(openvpn_net_ctx_t *ctx);
 
 /*
  * Inline functions
@@ -326,8 +335,6 @@ route_order(void)
 
 
 #ifdef _WIN32
-
-#define TUN_PASS_BUFFER
 
 struct tap_reg
 {
@@ -452,7 +459,7 @@ tun_write_win32(struct tuntap *tt, struct buffer *buf)
 }
 
 static inline int
-read_tun_buffered(struct tuntap *tt, struct buffer *buf, int maxsize)
+read_tun_buffered(struct tuntap *tt, struct buffer *buf)
 {
     return tun_finalize(tt->hand, &tt->reads, buf);
 }
@@ -504,7 +511,7 @@ tun_event_handle(const struct tuntap *tt)
 #endif
 }
 
-static inline unsigned int
+static inline void
 tun_set(struct tuntap *tt,
         struct event_set *es,
         unsigned int rwflags,
@@ -530,7 +537,6 @@ tun_set(struct tuntap *tt,
 #endif
         tt->rwflags_debug = rwflags;
     }
-    return rwflags;
 }
 
 const char *tun_stat(const struct tuntap *tt, unsigned int rwflags, struct gc_arena *gc);

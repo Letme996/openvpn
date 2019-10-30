@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -40,11 +40,13 @@
 #include "tun.h"
 #include "fdmisc.h"
 #include "common.h"
-#include "misc.h"
+#include "run_command.h"
 #include "socket.h"
 #include "manage.h"
 #include "route.h"
 #include "win32.h"
+#include "block_dns.h"
+#include "networking.h"
 
 #include "memdbg.h"
 
@@ -81,7 +83,6 @@ static DWORD get_adapter_index_flexible(const char *name);
 static bool
 do_address_service(const bool add, const short family, const struct tuntap *tt)
 {
-    DWORD len;
     bool ret = false;
     ack_message_t ack;
     struct gc_arena gc = gc_new();
@@ -114,17 +115,14 @@ do_address_service(const bool add, const short family, const struct tuntap *tt)
         addr.prefix_len = tt->netbits_ipv6;
     }
 
-    if (!WriteFile(pipe, &addr, sizeof(addr), &len, NULL)
-        || !ReadFile(pipe, &ack, sizeof(ack), &len, NULL))
+    if (!send_msg_iservice(pipe, &addr, sizeof(addr), &ack, "TUN"))
     {
-        msg(M_WARN, "TUN: could not talk to service: %s [%lu]",
-            strerror_win32(GetLastError(), &gc), GetLastError());
         goto out;
     }
 
     if (ack.error_number != NO_ERROR)
     {
-        msg(M_WARN, "TUN: %s address failed using service: %s [status=%u if_index=%lu]",
+        msg(M_WARN, "TUN: %s address failed using service: %s [status=%u if_index=%d]",
             (add ? "adding" : "deleting"), strerror_win32(ack.error_number, &gc),
             ack.error_number, addr.iface.index);
         goto out;
@@ -140,7 +138,6 @@ out:
 static bool
 do_dns6_service(bool add, const struct tuntap *tt)
 {
-    DWORD len;
     bool ret = false;
     ack_message_t ack;
     struct gc_arena gc = gc_new();
@@ -184,11 +181,8 @@ do_dns6_service(bool add, const struct tuntap *tt)
     msg(D_LOW, "%s IPv6 dns servers on '%s' (if_index = %d) using service",
         (add ? "Setting" : "Deleting"), dns.iface.name, dns.iface.index);
 
-    if (!WriteFile(pipe, &dns, sizeof(dns), &len, NULL)
-        || !ReadFile(pipe, &ack, sizeof(ack), &len, NULL))
+    if (!send_msg_iservice(pipe, &dns, sizeof(dns), &ack, "TUN"))
     {
-        msg(M_WARN, "TUN: could not talk to service: %s [%lu]",
-            strerror_win32(GetLastError(), &gc), GetLastError());
         goto out;
     }
 
@@ -459,13 +453,13 @@ check_subnet_conflict(const in_addr_t ip,
 }
 
 void
-warn_on_use_of_common_subnets(void)
+warn_on_use_of_common_subnets(openvpn_net_ctx_t *ctx)
 {
     struct gc_arena gc = gc_new();
     struct route_gateway_info rgi;
     const int needed = (RGI_ADDR_DEFINED|RGI_NETMASK_DEFINED);
 
-    get_default_gateway(&rgi);
+    get_default_gateway(&rgi, ctx);
     if ((rgi.flags & needed) == needed)
     {
         const in_addr_t lan_network = rgi.gateway.addr & rgi.gateway.netmask;
@@ -560,8 +554,8 @@ is_tun_p2p(const struct tuntap *tt)
     bool tun = false;
 
     if (tt->type == DEV_TYPE_TAP
-          || (tt->type == DEV_TYPE_TUN && tt->topology == TOP_SUBNET)
-          || tt->type == DEV_TYPE_NULL )
+        || (tt->type == DEV_TYPE_TUN && tt->topology == TOP_SUBNET)
+        || tt->type == DEV_TYPE_NULL)
     {
         tun = false;
     }
@@ -638,7 +632,8 @@ init_tun(const char *dev,        /* --dev option */
          struct addrinfo *local_public,
          struct addrinfo *remote_public,
          const bool strict_warn,
-         struct env_set *es)
+         struct env_set *es,
+         openvpn_net_ctx_t *ctx)
 {
     struct gc_arena gc = gc_new();
     struct tuntap *tt;
@@ -823,7 +818,7 @@ add_route_connected_v6_net(struct tuntap *tt,
     r6.gateway = tt->local_ipv6;
     r6.metric  = 0;                     /* connected route */
     r6.flags   = RT_DEFINED | RT_METRIC_DEFINED;
-    add_route_ipv6(&r6, tt, 0, es);
+    add_route_ipv6(&r6, tt, 0, es, NULL);
 }
 
 void
@@ -838,12 +833,13 @@ delete_route_connected_v6_net(struct tuntap *tt,
     r6.gateway = tt->local_ipv6;
     r6.metric  = 0;                     /* connected route */
     r6.flags   = RT_DEFINED | RT_ADDED | RT_METRIC_DEFINED;
-    delete_route_ipv6(&r6, tt, 0, es);
+    route_ipv6_clear_host_bits(&r6);
+    delete_route_ipv6(&r6, tt, 0, es, NULL);
 }
 #endif /* if defined(_WIN32) || defined(TARGET_DARWIN) || defined(TARGET_NETBSD) || defined(TARGET_OPENBSD) */
 
 #if defined(TARGET_FREEBSD) || defined(TARGET_DRAGONFLY)  \
-    || defined(TARGET_OPENBSD)
+    || defined(TARGET_NETBSD) || defined(TARGET_OPENBSD)
 /* we can't use true subnet mode on tun on all platforms, as that
  * conflicts with IPv6 (wants to use ND then, which we don't do),
  * but the OSes want "a remote address that is different from ours"
@@ -869,724 +865,577 @@ create_arbitrary_remote( struct tuntap *tt )
 }
 #endif
 
-/* execute the ifconfig command through the shell */
-void
-do_ifconfig(struct tuntap *tt,
-            const char *actual,     /* actual device name */
-            int tun_mtu,
-            const struct env_set *es)
+/**
+ * do_ifconfig_ipv6 - perform platform specific ifconfig6 commands
+ *
+ * @param tt        the tuntap interface context
+ * @param ifname    the human readable interface name
+ * @param mtu       the MTU value to set the interface to
+ * @param es        the environment to be used when executing the commands
+ * @param ctx       the networking API opaque context
+ */
+static void
+do_ifconfig_ipv6(struct tuntap *tt, const char *ifname, int tun_mtu,
+                 const struct env_set *es, openvpn_net_ctx_t *ctx)
 {
+#if !defined(TARGET_LINUX)
+    struct argv argv = argv_new();
     struct gc_arena gc = gc_new();
-
-    if (tt->did_ifconfig_setup)
-    {
-        bool tun = false;
-        const char *ifconfig_local = NULL;
-        const char *ifconfig_remote_netmask = NULL;
-        const char *ifconfig_broadcast = NULL;
-        const char *ifconfig_ipv6_local = NULL;
-        bool do_ipv6 = false;
-        struct argv argv = argv_new();
-
-        msg( M_DEBUG, "do_ifconfig, tt->did_ifconfig_ipv6_setup=%d",
-             tt->did_ifconfig_ipv6_setup );
-
-        /*
-         * We only handle TUN/TAP devices here, not --dev null devices.
-         */
-        tun = is_tun_p2p(tt);
-
-        /*
-         * Set ifconfig parameters
-         */
-        ifconfig_local = print_in_addr_t(tt->local, 0, &gc);
-        ifconfig_remote_netmask = print_in_addr_t(tt->remote_netmask, 0, &gc);
-
-        if (tt->did_ifconfig_ipv6_setup)
-        {
-            ifconfig_ipv6_local = print_in6_addr(tt->local_ipv6, 0, &gc);
-            do_ipv6 = true;
-        }
-
-        /*
-         * If TAP-style device, generate broadcast address.
-         */
-        if (!tun)
-        {
-            ifconfig_broadcast = print_in_addr_t(tt->broadcast, 0, &gc);
-        }
-
-#ifdef ENABLE_MANAGEMENT
-        if (management)
-        {
-            management_set_state(management,
-                                 OPENVPN_STATE_ASSIGN_IP,
-                                 NULL,
-                                 &tt->local,
-                                 &tt->local_ipv6,
-                                 NULL,
-                                 NULL);
-        }
+    const char *ifconfig_ipv6_local = print_in6_addr(tt->local_ipv6, 0, &gc);
 #endif
 
+#if defined(TARGET_LINUX)
+    if (net_iface_mtu_set(ctx, ifname, tun_mtu) < 0)
+    {
+        msg(M_FATAL, "Linux can't set mtu (%d) on %s", tun_mtu, ifname);
+    }
+
+    if (net_iface_up(ctx, ifname, true) < 0)
+    {
+        msg(M_FATAL, "Linux can't bring %s up", ifname);
+    }
+
+    if (net_addr_v6_add(ctx, ifname, &tt->local_ipv6,
+                        tt->netbits_ipv6) < 0)
+    {
+        msg(M_FATAL, "Linux can't add IPv6 to interface %s", ifname);
+    }
+#elif defined(TARGET_ANDROID)
+    char out6[64];
+
+    openvpn_snprintf(out6, sizeof(out6), "%s/%d %d",
+                     ifconfig_ipv6_local, tt->netbits_ipv6, tun_mtu);
+    management_android_control(management, "IFCONFIG6", out6);
+#elif defined(TARGET_SOLARIS)
+    argv_printf(&argv, "%s %s inet6 unplumb", IFCONFIG_PATH, ifname);
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, 0, NULL);
+
+    if (tt->type == DEV_TYPE_TUN)
+    {
+        const char *ifconfig_ipv6_remote = print_in6_addr(tt->remote_ipv6, 0, &gc);
+
+        argv_printf(&argv, "%s %s inet6 plumb %s/%d %s mtu %d up",
+                    IFCONFIG_PATH, ifname, ifconfig_ipv6_local,
+                    tt->netbits_ipv6, ifconfig_ipv6_remote, tun_mtu);
+    }
+    else /* tap mode */
+    {
+        /* base IPv6 tap interface needs to be brought up first */
+        argv_printf(&argv, "%s %s inet6 plumb up", IFCONFIG_PATH, ifname);
+        argv_msg(M_INFO, &argv);
+
+        if (!openvpn_execve_check(&argv, es, 0,
+                                  "Solaris ifconfig IPv6 (prepare) failed"))
+        {
+            solaris_error_close(tt, es, ifname, true);
+        }
+
+        /* we might need to do "ifconfig %s inet6 auto-dhcp drop"
+         * after the system has noticed the interface and fired up
+         * the DHCPv6 client - but this takes quite a while, and the
+         * server will ignore the DHCPv6 packets anyway.  So we don't.
+         */
+
+        /* static IPv6 addresses need to go to a subinterface (tap0:1)
+         * and we cannot set an mtu here (must go to the "parent")
+         */
+        argv_printf(&argv, "%s %s inet6 addif %s/%d up", IFCONFIG_PATH,
+                    ifname, ifconfig_ipv6_local, tt->netbits_ipv6 );
+    }
+    argv_msg(M_INFO, &argv);
+
+    if (!openvpn_execve_check(&argv, es, 0, "Solaris ifconfig IPv6 failed"))
+    {
+        solaris_error_close(tt, es, ifname, true);
+    }
+
+    if (tt->type != DEV_TYPE_TUN)
+    {
+        argv_printf(&argv, "%s %s inet6 mtu %d", IFCONFIG_PATH,
+                    ifname, tun_mtu);
+        argv_msg(M_INFO, &argv);
+        openvpn_execve_check(&argv, es, 0, "Solaris ifconfig IPv6 mtu failed");
+    }
+#elif defined(TARGET_OPENBSD) || defined(TARGET_NETBSD) \
+    || defined(TARGET_DARWIN) || defined(TARGET_FREEBSD) \
+    || defined(TARGET_DRAGONFLY)
+    argv_printf(&argv, "%s %s inet6 %s/%d mtu %d up", IFCONFIG_PATH, ifname,
+                ifconfig_ipv6_local, tt->netbits_ipv6, tun_mtu);
+    argv_msg(M_INFO, &argv);
+
+    openvpn_execve_check(&argv, es, S_FATAL,
+                         "generic BSD ifconfig inet6 failed");
+
+#if defined(TARGET_OPENBSD) || defined(TARGET_NETBSD) \
+    || defined(TARGET_DARWIN)
+    /* and, hooray, we explicitly need to add a route... */
+    add_route_connected_v6_net(tt, es);
+#endif
+#elif defined(TARGET_AIX)
+    argv_printf(&argv, "%s %s inet6 %s/%d mtu %d up", IFCONFIG_PATH, ifname,
+                ifconfig_ipv6_local, tt->netbits_ipv6, tun_mtu);
+    argv_msg(M_INFO, &argv);
+
+    /* AIX ifconfig will complain if it can't find ODM path in env */
+    es = env_set_create(NULL);
+    env_set_add(es, "ODMDIR=/etc/objrepos");
+
+    openvpn_execve_check(&argv, es, S_FATAL,
+                         "generic BSD ifconfig inet6 failed");
+
+    env_set_destroy(es);
+#elif defined (_WIN32)
+    if (tt->options.ip_win32_type == IPW32_SET_MANUAL)
+    {
+        msg(M_INFO, "******** NOTE:  Please manually set the v6 IP of '%s' to %s (if it is not already set)",
+            ifname, ifconfig_ipv6_local);
+    }
+    else if (tt->options.msg_channel)
+    {
+        do_address_service(true, AF_INET6, tt);
+        do_dns6_service(true, tt);
+    }
+    else
+    {
+        /* example: netsh interface ipv6 set address interface=42
+         *                  2001:608:8003::d store=active
+         */
+        char iface[64];
+
+        openvpn_snprintf(iface, sizeof(iface), "interface=%lu",
+                         tt->adapter_index);
+        argv_printf(&argv, "%s%sc interface ipv6 set address %s %s store=active",
+                    get_win_sys_path(), NETSH_PATH_SUFFIX, iface,
+                    ifconfig_ipv6_local);
+        netsh_command(&argv, 4, M_FATAL);
+        /* set ipv6 dns servers if any are specified */
+        netsh_set_dns6_servers(tt->options.dns6, tt->options.dns6_len, ifname);
+    }
+
+    /* explicit route needed */
+    if (tt->options.ip_win32_type != IPW32_SET_MANUAL)
+    {
+        add_route_connected_v6_net(tt, es);
+    }
+#else /* platforms we have no IPv6 code for */
+    msg(M_FATAL, "Sorry, but I don't know how to do IPv6 'ifconfig' commands on this operating system.  You should ifconfig your TUN/TAP device manually or use an --up script.");
+#endif /* outer "if defined(TARGET_xxx)" conditional */
+
+#if !defined(TARGET_LINUX)
+    gc_free(&gc);
+    argv_reset(&argv);
+#endif
+}
+
+/**
+ * do_ifconfig_ipv4 - perform platform specific ifconfig commands
+ *
+ * @param tt        the tuntap interface context
+ * @param ifname    the human readable interface name
+ * @param mtu       the MTU value to set the interface to
+ * @param es        the environment to be used when executing the commands
+ * @param ctx       the networking API opaque context
+ */
+static void
+do_ifconfig_ipv4(struct tuntap *tt, const char *ifname, int tun_mtu,
+                 const struct env_set *es, openvpn_net_ctx_t *ctx)
+{
+    /*
+     * We only handle TUN/TAP devices here, not --dev null devices.
+     */
+    bool tun = is_tun_p2p(tt);
+
+#if !defined(TARGET_LINUX)
+    const char *ifconfig_local = NULL;
+    const char *ifconfig_remote_netmask = NULL;
+    const char *ifconfig_broadcast = NULL;
+    struct argv argv = argv_new();
+    struct gc_arena gc = gc_new();
+
+    /*
+     * Set ifconfig parameters
+     */
+    ifconfig_local = print_in_addr_t(tt->local, 0, &gc);
+    ifconfig_remote_netmask = print_in_addr_t(tt->remote_netmask, 0, &gc);
+
+    /*
+     * If TAP-style device, generate broadcast address.
+     */
+    if (!tun)
+    {
+        ifconfig_broadcast = print_in_addr_t(tt->broadcast, 0, &gc);
+    }
+#endif
 
 #if defined(TARGET_LINUX)
-#ifdef ENABLE_IPROUTE
-        /*
-         * Set the MTU for the device
-         */
-        argv_printf(&argv,
-                    "%s link set dev %s up mtu %d",
-                    iproute_path,
-                    actual,
-                    tun_mtu
-                    );
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, es, S_FATAL, "Linux ip link set failed");
+    if (net_iface_mtu_set(ctx, ifname, tun_mtu) < 0)
+    {
+        msg(M_FATAL, "Linux can't set mtu (%d) on %s", tun_mtu, ifname);
+    }
 
-        if (tun)
-        {
+    if (net_iface_up(ctx, ifname, true) < 0)
+    {
+        msg(M_FATAL, "Linux can't bring %s up", ifname);
+    }
 
-            /*
-             * Set the address for the device
-             */
-            argv_printf(&argv,
-                        "%s addr add dev %s local %s peer %s",
-                        iproute_path,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask
-                        );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "Linux ip addr add failed");
-        }
-        else
+    if (tun)
+    {
+        if (net_addr_ptp_v4_add(ctx, ifname, &tt->local,
+                                &tt->remote_netmask) < 0)
         {
-            argv_printf(&argv,
-                        "%s addr add dev %s %s/%d broadcast %s",
-                        iproute_path,
-                        actual,
-                        ifconfig_local,
-                        netmask_to_netbits2(tt->remote_netmask),
-                        ifconfig_broadcast
-                        );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "Linux ip addr add failed");
+            msg(M_FATAL, "Linux can't add IP to TUN interface %s", ifname);
         }
-        if (do_ipv6)
+    }
+    else
+    {
+        if (net_addr_v4_add(ctx, ifname, &tt->local,
+                            netmask_to_netbits2(tt->remote_netmask),
+                            &tt->remote_netmask) < 0)
         {
-            argv_printf( &argv,
-                         "%s -6 addr add %s/%d dev %s",
-                         iproute_path,
-                         ifconfig_ipv6_local,
-                         tt->netbits_ipv6,
-                         actual
-                         );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "Linux ip -6 addr add failed");
+            msg(M_FATAL, "Linux can't add IP to TAP interface %s", ifname);
         }
-        tt->did_ifconfig = true;
-#else  /* ifdef ENABLE_IPROUTE */
-        if (tun)
-        {
-            argv_printf(&argv,
-                        "%s %s %s pointopoint %s mtu %d",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-        }
-        else
-        {
-            argv_printf(&argv,
-                        "%s %s %s netmask %s mtu %d broadcast %s",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu,
-                        ifconfig_broadcast
-                        );
-        }
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, es, S_FATAL, "Linux ifconfig failed");
-        if (do_ipv6)
-        {
-            argv_printf(&argv,
-                        "%s %s add %s/%d",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_ipv6_local,
-                        tt->netbits_ipv6
-                        );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "Linux ifconfig inet6 failed");
-        }
-        tt->did_ifconfig = true;
-
-#endif /*ENABLE_IPROUTE*/
+    }
 #elif defined(TARGET_ANDROID)
+    char out[64];
 
-        if (do_ipv6)
-        {
-            char out6[64];
-            openvpn_snprintf(out6, sizeof(out6), "%s/%d", ifconfig_ipv6_local,tt->netbits_ipv6);
-            management_android_control(management, "IFCONFIG6", out6);
-        }
+    char *top;
+    switch (tt->topology)
+    {
+        case TOP_NET30:
+            top = "net30";
+            break;
 
-        char out[64];
+        case TOP_P2P:
+            top = "p2p";
+            break;
 
-        char *top;
-        switch (tt->topology)
-        {
-            case TOP_NET30:
-                top = "net30";
-                break;
+        case TOP_SUBNET:
+            top = "subnet";
+            break;
 
-            case TOP_P2P:
-                top = "p2p";
-                break;
+        default:
+            top = "undef";
+    }
 
-            case TOP_SUBNET:
-                top = "subnet";
-                break;
-
-            default:
-                top = "undef";
-        }
-
-        openvpn_snprintf(out, sizeof(out), "%s %s %d %s", ifconfig_local, ifconfig_remote_netmask, tun_mtu, top);
-        management_android_control(management, "IFCONFIG", out);
+    openvpn_snprintf(out, sizeof(out), "%s %s %d %s", ifconfig_local,
+                     ifconfig_remote_netmask, tun_mtu, top);
+    management_android_control(management, "IFCONFIG", out);
 
 #elif defined(TARGET_SOLARIS)
-        /* Solaris 2.6 (and 7?) cannot set all parameters in one go...
-         * example:
-         *    ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 up
-         *    ifconfig tun2 netmask 255.255.255.255
-         */
-        if (tun)
-        {
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-
-            argv_msg(M_INFO, &argv);
-            if (!openvpn_execve_check(&argv, es, 0, "Solaris ifconfig phase-1 failed"))
-            {
-                solaris_error_close(tt, es, actual, false);
-            }
-
-            argv_printf(&argv,
-                        "%s %s netmask 255.255.255.255",
-                        IFCONFIG_PATH,
-                        actual
-                        );
-        }
-        else if (tt->topology == TOP_SUBNET)
-        {
-            argv_printf(&argv,
-                        "%s %s %s %s netmask %s mtu %d up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-        }
-        else
-        {
-            argv_printf(&argv,
-                        " %s %s %s netmask %s broadcast + up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask
-                        );
-        }
+    /* Solaris 2.6 (and 7?) cannot set all parameters in one go...
+     * example:
+     *    ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 up
+     *    ifconfig tun2 netmask 255.255.255.255
+     */
+    if (tun)
+    {
+        argv_printf(&argv, "%s %s %s %s mtu %d up", IFCONFIG_PATH, ifname,
+                    ifconfig_local, ifconfig_remote_netmask, tun_mtu);
 
         argv_msg(M_INFO, &argv);
-        if (!openvpn_execve_check(&argv, es, 0, "Solaris ifconfig phase-2 failed"))
+        if (!openvpn_execve_check(&argv, es, 0, "Solaris ifconfig phase-1 failed"))
         {
-            solaris_error_close(tt, es, actual, false);
+            solaris_error_close(tt, es, ifname, false);
         }
 
-        if (do_ipv6)
-        {
-            argv_printf(&argv, "%s %s inet6 unplumb",
-                        IFCONFIG_PATH, actual );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, 0, NULL);
+        argv_printf(&argv, "%s %s netmask 255.255.255.255", IFCONFIG_PATH,
+                    ifname);
+    }
+    else if (tt->topology == TOP_SUBNET)
+    {
+        argv_printf(&argv, "%s %s %s %s netmask %s mtu %d up", IFCONFIG_PATH,
+                    ifname, ifconfig_local, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu);
+    }
+    else
+    {
+        argv_printf(&argv, "%s %s %s netmask %s broadcast + up",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask);
+    }
 
-            if (tt->type == DEV_TYPE_TUN)
-            {
-                const char *ifconfig_ipv6_remote =
-                    print_in6_addr(tt->remote_ipv6, 0, &gc);
+    argv_msg(M_INFO, &argv);
+    if (!openvpn_execve_check(&argv, es, 0, "Solaris ifconfig phase-2 failed"))
+    {
+        solaris_error_close(tt, es, ifname, false);
+    }
 
-                argv_printf(&argv,
-                            "%s %s inet6 plumb %s/%d %s up",
-                            IFCONFIG_PATH,
-                            actual,
-                            ifconfig_ipv6_local,
-                            tt->netbits_ipv6,
-                            ifconfig_ipv6_remote
-                            );
-            }
-            else                                        /* tap mode */
-            {
-                /* base IPv6 tap interface needs to be brought up first
-                 */
-                argv_printf(&argv, "%s %s inet6 plumb up",
-                            IFCONFIG_PATH, actual );
-                argv_msg(M_INFO, &argv);
-                if (!openvpn_execve_check(&argv, es, 0, "Solaris ifconfig IPv6 (prepare) failed"))
-                {
-                    solaris_error_close(tt, es, actual, true);
-                }
-
-                /* we might need to do "ifconfig %s inet6 auto-dhcp drop"
-                 * after the system has noticed the interface and fired up
-                 * the DHCPv6 client - but this takes quite a while, and the
-                 * server will ignore the DHCPv6 packets anyway.  So we don't.
-                 */
-
-                /* static IPv6 addresses need to go to a subinterface (tap0:1)
-                 */
-                argv_printf(&argv,
-                            "%s %s inet6 addif %s/%d up",
-                            IFCONFIG_PATH, actual,
-                            ifconfig_ipv6_local, tt->netbits_ipv6 );
-            }
-            argv_msg(M_INFO, &argv);
-            if (!openvpn_execve_check(&argv, es, 0, "Solaris ifconfig IPv6 failed"))
-            {
-                solaris_error_close(tt, es, actual, true);
-            }
-        }
-
-        if (!tun && tt->topology == TOP_SUBNET)
-        {
-            /* Add a network route for the local tun interface */
-            struct route_ipv4 r;
-            CLEAR(r);
-            r.flags = RT_DEFINED | RT_METRIC_DEFINED;
-            r.network = tt->local & tt->remote_netmask;
-            r.netmask = tt->remote_netmask;
-            r.gateway = tt->local;
-            r.metric = 0;
-            add_route(&r, tt, 0, NULL, es);
-        }
-
-        tt->did_ifconfig = true;
+    if (!tun && tt->topology == TOP_SUBNET)
+    {
+        /* Add a network route for the local tun interface */
+        struct route_ipv4 r;
+        CLEAR(r);
+        r.flags = RT_DEFINED | RT_METRIC_DEFINED;
+        r.network = tt->local & tt->remote_netmask;
+        r.netmask = tt->remote_netmask;
+        r.gateway = tt->local;
+        r.metric = 0;
+        add_route(&r, tt, 0, NULL, es, NULL);
+    }
 
 #elif defined(TARGET_OPENBSD)
 
-        in_addr_t remote_end;           /* for "virtual" subnet topology */
+    in_addr_t remote_end;           /* for "virtual" subnet topology */
 
-        /*
-         * On OpenBSD, tun interfaces are persistent if created with
-         * "ifconfig tunX create", and auto-destroyed if created by
-         * opening "/dev/tunX" (so we just use the /dev/tunX)
-         */
+    /*
+     * On OpenBSD, tun interfaces are persistent if created with
+     * "ifconfig tunX create", and auto-destroyed if created by
+     * opening "/dev/tunX" (so we just use the /dev/tunX)
+     */
 
-        /* example: ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 netmask 255.255.255.255 up */
-        if (tun)
-        {
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d netmask 255.255.255.255 up -link0",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-        }
-        else if (tt->topology == TOP_SUBNET)
-        {
-            remote_end = create_arbitrary_remote( tt );
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d netmask %s up -link0",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        print_in_addr_t(remote_end, 0, &gc),
-                        tun_mtu,
-                        ifconfig_remote_netmask
-                        );
-        }
-        else
-        {
-            argv_printf(&argv,
-                        "%s %s %s netmask %s mtu %d broadcast %s link0",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu,
-                        ifconfig_broadcast
-                        );
-        }
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, es, S_FATAL, "OpenBSD ifconfig failed");
+    /* example: ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 netmask 255.255.255.255 up */
+    if (tun)
+    {
+        argv_printf(&argv,
+                    "%s %s %s %s mtu %d netmask 255.255.255.255 up -link0",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu);
+    }
+    else if (tt->topology == TOP_SUBNET)
+    {
+        remote_end = create_arbitrary_remote( tt );
+        argv_printf(&argv, "%s %s %s %s mtu %d netmask %s up -link0",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    print_in_addr_t(remote_end, 0, &gc), tun_mtu,
+                    ifconfig_remote_netmask);
+    }
+    else
+    {
+        argv_printf(&argv, "%s %s %s netmask %s mtu %d broadcast %s link0",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu, ifconfig_broadcast);
+    }
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, S_FATAL, "OpenBSD ifconfig failed");
 
-        /* Add a network route for the local tun interface */
-        if (!tun && tt->topology == TOP_SUBNET)
-        {
-            struct route_ipv4 r;
-            CLEAR(r);
-            r.flags = RT_DEFINED;
-            r.network = tt->local & tt->remote_netmask;
-            r.netmask = tt->remote_netmask;
-            r.gateway = remote_end;
-            add_route(&r, tt, 0, NULL, es);
-        }
-
-        if (do_ipv6)
-        {
-            argv_printf(&argv,
-                        "%s %s inet6 %s/%d",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_ipv6_local,
-                        tt->netbits_ipv6
-                        );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "OpenBSD ifconfig inet6 failed");
-
-            /* and, hooray, we explicitely need to add a route... */
-            add_route_connected_v6_net(tt, es);
-        }
-        tt->did_ifconfig = true;
+    /* Add a network route for the local tun interface */
+    if (!tun && tt->topology == TOP_SUBNET)
+    {
+        struct route_ipv4 r;
+        CLEAR(r);
+        r.flags = RT_DEFINED;
+        r.network = tt->local & tt->remote_netmask;
+        r.netmask = tt->remote_netmask;
+        r.gateway = remote_end;
+        add_route(&r, tt, 0, NULL, es, NULL);
+    }
 
 #elif defined(TARGET_NETBSD)
+    in_addr_t remote_end;           /* for "virtual" subnet topology */
 
-        if (tun)
-        {
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d netmask 255.255.255.255 up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-        }
-        else if (tt->topology == TOP_SUBNET)
-        {
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d netmask %s up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_local,
-                        tun_mtu,
-                        ifconfig_remote_netmask
-                        );
-        }
-        else
-        {
-            /*
-             * NetBSD has distinct tun and tap devices
-             * so we don't need the "link0" extra parameter to specify we want to do
-             * tunneling at the ethernet level
-             */
-            argv_printf(&argv,
-                        "%s %s %s netmask %s mtu %d broadcast %s",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu,
-                        ifconfig_broadcast
-                        );
-        }
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, es, S_FATAL, "NetBSD ifconfig failed");
+    if (tun)
+    {
+        argv_printf(&argv, "%s %s %s %s mtu %d netmask 255.255.255.255 up",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu);
+    }
+    else if (tt->topology == TOP_SUBNET)
+    {
+        remote_end = create_arbitrary_remote(tt);
+        argv_printf(&argv, "%s %s %s %s mtu %d netmask %s up", IFCONFIG_PATH,
+                    ifname, ifconfig_local, print_in_addr_t(remote_end, 0, &gc),
+                    tun_mtu, ifconfig_remote_netmask);
+    }
+    else
+    {
+        /*
+         * NetBSD has distinct tun and tap devices
+         * so we don't need the "link0" extra parameter to specify we want to do
+         * tunneling at the ethernet level
+         */
+        argv_printf(&argv, "%s %s %s netmask %s mtu %d broadcast %s",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu, ifconfig_broadcast);
+    }
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, S_FATAL, "NetBSD ifconfig failed");
 
-        if (do_ipv6)
-        {
-            argv_printf(&argv,
-                        "%s %s inet6 %s/%d",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_ipv6_local,
-                        tt->netbits_ipv6
-                        );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "NetBSD ifconfig inet6 failed");
-
-            /* and, hooray, we explicitely need to add a route... */
-            add_route_connected_v6_net(tt, es);
-        }
-        tt->did_ifconfig = true;
+    /* Add a network route for the local tun interface */
+    if (!tun && tt->topology == TOP_SUBNET)
+    {
+        struct route_ipv4 r;
+        CLEAR(r);
+        r.flags = RT_DEFINED;
+        r.network = tt->local & tt->remote_netmask;
+        r.netmask = tt->remote_netmask;
+        r.gateway = remote_end;
+        add_route(&r, tt, 0, NULL, es, NULL);
+    }
 
 #elif defined(TARGET_DARWIN)
-        /*
-         * Darwin (i.e. Mac OS X) seems to exhibit similar behaviour to OpenBSD...
-         */
+    /*
+     * Darwin (i.e. Mac OS X) seems to exhibit similar behaviour to OpenBSD...
+     */
 
-        argv_printf(&argv,
-                    "%s %s delete",
-                    IFCONFIG_PATH,
-                    actual);
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, es, 0, NULL);
-        msg(M_INFO, "NOTE: Tried to delete pre-existing tun/tap instance -- No Problem if failure");
+    argv_printf(&argv, "%s %s delete", IFCONFIG_PATH, ifname);
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, 0, NULL);
+    msg(M_INFO,
+        "NOTE: Tried to delete pre-existing tun/tap instance -- No Problem if failure");
 
 
-        /* example: ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 netmask 255.255.255.255 up */
-        if (tun)
+    /* example: ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 netmask 255.255.255.255 up */
+    if (tun)
+    {
+        argv_printf(&argv, "%s %s %s %s mtu %d netmask 255.255.255.255 up",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu);
+    }
+    else
+    {
+        if (tt->topology == TOP_SUBNET)
         {
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d netmask 255.255.255.255 up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
+            argv_printf(&argv, "%s %s %s %s netmask %s mtu %d up",
+                        IFCONFIG_PATH, ifname, ifconfig_local, ifconfig_local,
+                        ifconfig_remote_netmask, tun_mtu);
         }
         else
         {
-            if (tt->topology == TOP_SUBNET)
-            {
-                argv_printf(&argv,
-                            "%s %s %s %s netmask %s mtu %d up",
-                            IFCONFIG_PATH,
-                            actual,
-                            ifconfig_local,
-                            ifconfig_local,
-                            ifconfig_remote_netmask,
-                            tun_mtu
-                            );
-            }
-            else
-            {
-                argv_printf(&argv,
-                            "%s %s %s netmask %s mtu %d up",
-                            IFCONFIG_PATH,
-                            actual,
-                            ifconfig_local,
-                            ifconfig_remote_netmask,
-                            tun_mtu
-                            );
-            }
+            argv_printf(&argv, "%s %s %s netmask %s mtu %d up", IFCONFIG_PATH,
+                        ifname, ifconfig_local, ifconfig_remote_netmask,
+                        tun_mtu);
         }
+    }
 
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, es, S_FATAL, "Mac OS X ifconfig failed");
-        tt->did_ifconfig = true;
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, S_FATAL, "Mac OS X ifconfig failed");
 
-        /* Add a network route for the local tun interface */
-        if (!tun && tt->topology == TOP_SUBNET)
-        {
-            struct route_ipv4 r;
-            CLEAR(r);
-            r.flags = RT_DEFINED;
-            r.network = tt->local & tt->remote_netmask;
-            r.netmask = tt->remote_netmask;
-            r.gateway = tt->local;
-            add_route(&r, tt, 0, NULL, es);
-        }
-
-        if (do_ipv6)
-        {
-            argv_printf(&argv,
-                        "%s %s inet6 %s/%d",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_ipv6_local,
-                        tt->netbits_ipv6
-                        );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "MacOS X ifconfig inet6 failed");
-
-            /* and, hooray, we explicitely need to add a route... */
-            add_route_connected_v6_net(tt, es);
-        }
+    /* Add a network route for the local tun interface */
+    if (!tun && tt->topology == TOP_SUBNET)
+    {
+        struct route_ipv4 r;
+        CLEAR(r);
+        r.flags = RT_DEFINED;
+        r.network = tt->local & tt->remote_netmask;
+        r.netmask = tt->remote_netmask;
+        r.gateway = tt->local;
+        add_route(&r, tt, 0, NULL, es, NULL);
+    }
 
 #elif defined(TARGET_FREEBSD) || defined(TARGET_DRAGONFLY)
 
-        in_addr_t remote_end;           /* for "virtual" subnet topology */
+    in_addr_t remote_end;           /* for "virtual" subnet topology */
 
-        /* example: ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 netmask 255.255.255.255 up */
-        if (tun)
-        {
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d netmask 255.255.255.255 up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-        }
-        else if (tt->topology == TOP_SUBNET)
-        {
-            remote_end = create_arbitrary_remote( tt );
-            argv_printf(&argv,
-                        "%s %s %s %s mtu %d netmask %s up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        print_in_addr_t(remote_end, 0, &gc),
-                        tun_mtu,
-                        ifconfig_remote_netmask
-                        );
-        }
-        else
-        {
-            argv_printf(&argv,
-                        "%s %s %s netmask %s mtu %d up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-        }
+    /* example: ifconfig tun2 10.2.0.2 10.2.0.1 mtu 1450 netmask 255.255.255.255 up */
+    if (tun)
+    {
+        argv_printf(&argv, "%s %s %s %s mtu %d netmask 255.255.255.255 up",
+                    IFCONFIG_PATH, ifname, ifconfig_local,
+                    ifconfig_remote_netmask, tun_mtu);
+    }
+    else if (tt->topology == TOP_SUBNET)
+    {
+        remote_end = create_arbitrary_remote( tt );
+        argv_printf(&argv, "%s %s %s %s mtu %d netmask %s up", IFCONFIG_PATH,
+                    ifname, ifconfig_local, print_in_addr_t(remote_end, 0, &gc),
+                    tun_mtu, ifconfig_remote_netmask);
+    }
+    else
+    {
+        argv_printf(&argv, "%s %s %s netmask %s mtu %d up", IFCONFIG_PATH,
+                    ifname, ifconfig_local, ifconfig_remote_netmask, tun_mtu);
+    }
 
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, es, S_FATAL, "FreeBSD ifconfig failed");
-        tt->did_ifconfig = true;
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, S_FATAL, "FreeBSD ifconfig failed");
 
-        /* Add a network route for the local tun interface */
-        if (!tun && tt->topology == TOP_SUBNET)
-        {
-            struct route_ipv4 r;
-            CLEAR(r);
-            r.flags = RT_DEFINED;
-            r.network = tt->local & tt->remote_netmask;
-            r.netmask = tt->remote_netmask;
-            r.gateway = remote_end;
-            add_route(&r, tt, 0, NULL, es);
-        }
-
-        if (do_ipv6)
-        {
-            argv_printf(&argv,
-                        "%s %s inet6 %s/%d",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_ipv6_local,
-                        tt->netbits_ipv6
-                        );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, es, S_FATAL, "FreeBSD ifconfig inet6 failed");
-        }
+    /* Add a network route for the local tun interface */
+    if (!tun && tt->topology == TOP_SUBNET)
+    {
+        struct route_ipv4 r;
+        CLEAR(r);
+        r.flags = RT_DEFINED;
+        r.network = tt->local & tt->remote_netmask;
+        r.netmask = tt->remote_netmask;
+        r.gateway = remote_end;
+        add_route(&r, tt, 0, NULL, es, NULL);
+    }
 
 #elif defined(TARGET_AIX)
+    {
+        /* AIX ifconfig will complain if it can't find ODM path in env */
+        struct env_set *aix_es = env_set_create(NULL);
+        env_set_add( aix_es, "ODMDIR=/etc/objrepos" );
+
+        if (tun)
         {
-            /* AIX ifconfig will complain if it can't find ODM path in env */
-            struct env_set *aix_es = env_set_create(NULL);
-            env_set_add( aix_es, "ODMDIR=/etc/objrepos" );
-
-            if (tun)
-            {
-                msg(M_FATAL, "no tun support on AIX (canthappen)");
-            }
-
-            /* example: ifconfig tap0 172.30.1.1 netmask 255.255.254.0 up */
-            argv_printf(&argv,
-                        "%s %s %s netmask %s mtu %d up",
-                        IFCONFIG_PATH,
-                        actual,
-                        ifconfig_local,
-                        ifconfig_remote_netmask,
-                        tun_mtu
-                        );
-
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, aix_es, S_FATAL, "AIX ifconfig failed");
-            tt->did_ifconfig = true;
-
-            if (do_ipv6)
-            {
-                argv_printf(&argv,
-                            "%s %s inet6 %s/%d",
-                            IFCONFIG_PATH,
-                            actual,
-                            ifconfig_ipv6_local,
-                            tt->netbits_ipv6
-                            );
-                argv_msg(M_INFO, &argv);
-                openvpn_execve_check(&argv, aix_es, S_FATAL, "AIX ifconfig inet6 failed");
-            }
-            env_set_destroy(aix_es);
-        }
-#elif defined (_WIN32)
-        {
-            ASSERT(actual != NULL);
-
-            switch (tt->options.ip_win32_type)
-            {
-                case IPW32_SET_MANUAL:
-                    msg(M_INFO, "******** NOTE:  Please manually set the IP/netmask of '%s' to %s/%s (if it is not already set)",
-                        actual,
-                        ifconfig_local,
-                        print_in_addr_t(tt->adapter_netmask, 0, &gc));
-                    break;
-
-                case IPW32_SET_NETSH:
-                    netsh_ifconfig(&tt->options,
-                                   actual,
-                                   tt->local,
-                                   tt->adapter_netmask,
-                                   NI_IP_NETMASK|NI_OPTIONS);
-
-                    break;
-            }
-            tt->did_ifconfig = true;
+            msg(M_FATAL, "no tun support on AIX (canthappen)");
         }
 
-        if (do_ipv6)
-        {
-            if (tt->options.ip_win32_type == IPW32_SET_MANUAL)
-            {
-                msg(M_INFO, "******** NOTE:  Please manually set the v6 IP of '%s' to %s (if it is not already set)",
-                    actual,
-                    ifconfig_ipv6_local);
-            }
-            else if (tt->options.msg_channel)
-            {
-                do_address_service(true, AF_INET6, tt);
-                do_dns6_service(true, tt);
-            }
-            else
-            {
-                /* example: netsh interface ipv6 set address interface=42 2001:608:8003::d store=active */
-                char iface[64];
-                openvpn_snprintf(iface, sizeof(iface), "interface=%lu", tt->adapter_index );
-                argv_printf(&argv,
-                            "%s%sc interface ipv6 set address %s %s store=active",
-                            get_win_sys_path(),
-                            NETSH_PATH_SUFFIX,
-                            iface,
-                            ifconfig_ipv6_local );
-                netsh_command(&argv, 4, M_FATAL);
-                /* set ipv6 dns servers if any are specified */
-                netsh_set_dns6_servers(tt->options.dns6, tt->options.dns6_len, actual);
-            }
+        /* example: ifconfig tap0 172.30.1.1 netmask 255.255.254.0 up */
+        argv_printf(&argv, "%s %s %s netmask %s mtu %d up", IFCONFIG_PATH,
+                    ifname, ifconfig_local, ifconfig_remote_netmask, tun_mtu);
 
-            /* explicit route needed */
-            if (tt->options.ip_win32_type != IPW32_SET_MANUAL)
-            {
-                add_route_connected_v6_net(tt, es);
-            }
-        }
-#else  /* if defined(TARGET_LINUX) */
-        msg(M_FATAL, "Sorry, but I don't know how to do 'ifconfig' commands on this operating system.  You should ifconfig your TUN/TAP device manually or use an --up script.");
-#endif /* if defined(TARGET_LINUX) */
-        argv_reset(&argv);
+        argv_msg(M_INFO, &argv);
+        openvpn_execve_check(&argv, aix_es, S_FATAL, "AIX ifconfig failed");
+
+        env_set_destroy(aix_es);
     }
+#elif defined (_WIN32)
+    {
+        ASSERT(ifname != NULL);
+
+        switch (tt->options.ip_win32_type)
+        {
+            case IPW32_SET_MANUAL:
+                msg(M_INFO,
+                    "******** NOTE:  Please manually set the IP/netmask of '%s' to %s/%s (if it is not already set)",
+                    ifname, ifconfig_local,
+                    print_in_addr_t(tt->adapter_netmask, 0, &gc));
+                break;
+
+            case IPW32_SET_NETSH:
+                netsh_ifconfig(&tt->options, ifname, tt->local,
+                               tt->adapter_netmask, NI_IP_NETMASK|NI_OPTIONS);
+
+                break;
+        }
+    }
+
+#else  /* if defined(TARGET_LINUX) */
+    msg(M_FATAL, "Sorry, but I don't know how to do 'ifconfig' commands on this operating system.  You should ifconfig your TUN/TAP device manually or use an --up script.");
+#endif /* if defined(TARGET_LINUX) */
+
+#if !defined(TARGET_LINUX)
     gc_free(&gc);
+    argv_reset(&argv);
+#endif
+}
+
+/* execute the ifconfig command through the shell */
+void
+do_ifconfig(struct tuntap *tt, const char *ifname, int tun_mtu,
+            const struct env_set *es, openvpn_net_ctx_t *ctx)
+{
+    msg(D_LOW, "do_ifconfig, ipv4=%d, ipv6=%d", tt->did_ifconfig_setup,
+        tt->did_ifconfig_ipv6_setup);
+
+#ifdef ENABLE_MANAGEMENT
+    if (management)
+    {
+        management_set_state(management,
+                             OPENVPN_STATE_ASSIGN_IP,
+                             NULL,
+                             &tt->local,
+                             &tt->local_ipv6,
+                             NULL,
+                             NULL);
+    }
+#endif
+
+    if (tt->did_ifconfig_setup)
+    {
+        do_ifconfig_ipv4(tt, ifname, tun_mtu, es, ctx);
+    }
+
+    if (tt->did_ifconfig_ipv6_setup)
+    {
+        do_ifconfig_ipv6(tt, ifname, tun_mtu, es, ctx);
+    }
+
+    /* release resources potentially allocated during interface setup */
+    net_ctx_free(ctx);
 }
 
 static void
@@ -1896,13 +1745,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 }
 
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    if (tt)
-    {
-        close_tun_generic(tt);
-        free(tt);
-    }
+    ASSERT(tt);
+
+    close_tun_generic(tt);
+    free(tt);
 }
 
 int
@@ -2048,12 +1896,14 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
     ASSERT(0);
 }
 
-#endif /* !PENDANTIC */
+#endif /* !PEDANTIC */
 
 #ifdef ENABLE_FEATURE_TUN_PERSIST
 
 void
-tuncfg(const char *dev, const char *dev_type, const char *dev_node, int persist_mode, const char *username, const char *groupname, const struct tuntap_options *options)
+tuncfg(const char *dev, const char *dev_type, const char *dev_node,
+       int persist_mode, const char *username, const char *groupname,
+       const struct tuntap_options *options, openvpn_net_ctx_t *ctx)
 {
     struct tuntap *tt;
 
@@ -2092,86 +1942,95 @@ tuncfg(const char *dev, const char *dev_type, const char *dev_node, int persist_
             msg(M_ERR, "Cannot ioctl TUNSETOWNER(%s) %s", groupname, dev);
         }
     }
-    close_tun(tt);
+    close_tun(tt, ctx);
     msg(M_INFO, "Persist state set to: %s", (persist_mode ? "ON" : "OFF"));
 }
 
 #endif /* ENABLE_FEATURE_TUN_PERSIST */
 
-void
-close_tun(struct tuntap *tt)
+static void
+undo_ifconfig_ipv4(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    if (tt)
+#if defined(TARGET_LINUX)
+    int netbits = netmask_to_netbits2(tt->remote_netmask);
+
+    if (is_tun_p2p(tt))
     {
-        if (tt->type != DEV_TYPE_NULL && tt->did_ifconfig)
+        if (net_addr_ptp_v4_del(ctx, tt->actual_name, &tt->local,
+                                &tt->remote_netmask) < 0)
         {
-            struct argv argv = argv_new();
-            struct gc_arena gc = gc_new();
-
-#ifdef ENABLE_IPROUTE
-            if (is_tun_p2p(tt))
-            {
-                argv_printf(&argv,
-                            "%s addr del dev %s local %s peer %s",
-                            iproute_path,
-                            tt->actual_name,
-                            print_in_addr_t(tt->local, 0, &gc),
-                            print_in_addr_t(tt->remote_netmask, 0, &gc)
-                            );
-            }
-            else
-            {
-                argv_printf(&argv,
-                            "%s addr del dev %s %s/%d",
-                            iproute_path,
-                            tt->actual_name,
-                            print_in_addr_t(tt->local, 0, &gc),
-                            netmask_to_netbits2(tt->remote_netmask)
-                            );
-            }
-#else  /* ifdef ENABLE_IPROUTE */
-            argv_printf(&argv,
-                        "%s %s 0.0.0.0",
-                        IFCONFIG_PATH,
-                        tt->actual_name
-                        );
-#endif /* ifdef ENABLE_IPROUTE */
-
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, NULL, 0, "Linux ip addr del failed");
-
-            if (tt->did_ifconfig_ipv6_setup)
-            {
-                const char *ifconfig_ipv6_local = print_in6_addr(tt->local_ipv6, 0, &gc);
-
-#ifdef ENABLE_IPROUTE
-                argv_printf(&argv, "%s -6 addr del %s/%d dev %s",
-                            iproute_path,
-                            ifconfig_ipv6_local,
-                            tt->netbits_ipv6,
-                            tt->actual_name
-                            );
-                argv_msg(M_INFO, &argv);
-                openvpn_execve_check(&argv, NULL, 0, "Linux ip -6 addr del failed");
-#else  /* ifdef ENABLE_IPROUTE */
-                argv_printf(&argv,
-                            "%s %s del %s/%d",
-                            IFCONFIG_PATH,
-                            tt->actual_name,
-                            ifconfig_ipv6_local,
-                            tt->netbits_ipv6
-                            );
-                argv_msg(M_INFO, &argv);
-                openvpn_execve_check(&argv, NULL, 0, "Linux ifconfig inet6 del failed");
-#endif
-            }
-
-            argv_reset(&argv);
-            gc_free(&gc);
+            msg(M_WARN, "Linux can't del IP from TUN iface %s",
+                tt->actual_name);
         }
-        close_tun_generic(tt);
-        free(tt);
     }
+    else
+    {
+        if (net_addr_v4_del(ctx, tt->actual_name, &tt->local, netbits) < 0)
+        {
+            msg(M_WARN, "Linux can't del IP from TAP iface %s",
+                tt->actual_name);
+        }
+    }
+#else  /* ifndef TARGET_LINUX */
+    struct argv argv = argv_new();
+
+    argv_printf(&argv, "%s %s 0.0.0.0", IFCONFIG_PATH, tt->actual_name);
+
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, NULL, 0, "Generic ip addr del failed");
+
+    argv_reset(&argv);
+#endif /* ifdef TARGET_LINUX */
+}
+
+static void
+undo_ifconfig_ipv6(struct tuntap *tt, openvpn_net_ctx_t *ctx)
+{
+#if defined(TARGET_LINUX)
+    if (net_addr_v6_del(ctx, tt->actual_name, &tt->local_ipv6,
+                        tt->netbits_ipv6) < 0)
+    {
+        msg(M_WARN, "Linux can't del IPv6 from iface %s", tt->actual_name);
+    }
+#else  /* ifndef TARGET_LINUX */
+    struct gc_arena gc = gc_new();
+    const char *ifconfig_ipv6_local = print_in6_addr(tt->local_ipv6, 0, gc);
+    struct argv argv = argv_new();
+
+    argv_printf(&argv, "%s %s del %s/%d", IFCONFIG_PATH, tt->actual_name,
+                ifconfig_ipv6_local, tt->netbits_ipv6);
+
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, NULL, 0, "Linux ip -6 addr del failed");
+
+    argv_reset(&argv);
+    gc_free(&gc);
+#endif /* ifdef TARGET_LINUX */
+}
+
+void
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
+{
+    ASSERT(tt);
+
+    if (tt->type != DEV_TYPE_NULL)
+    {
+        if (tt->did_ifconfig_setup)
+        {
+            undo_ifconfig_ipv4(tt, ctx);
+        }
+
+        if (tt->did_ifconfig_ipv6_setup)
+        {
+            undo_ifconfig_ipv6(tt, ctx);
+        }
+
+        /* release resources potentially allocated during undo */
+        net_ctx_reset(ctx);
+    }
+
+    close_tun_generic(tt);
+    free(tt);
 }
 
 int
@@ -2429,57 +2288,54 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 static void
 solaris_close_tun(struct tuntap *tt)
 {
-    if (tt)
+    /* IPv6 interfaces need to be 'manually' de-configured */
+    if (tt->did_ifconfig_ipv6_setup)
     {
-        /* IPv6 interfaces need to be 'manually' de-configured */
-        if (tt->did_ifconfig_ipv6_setup)
+        struct argv argv = argv_new();
+        argv_printf( &argv, "%s %s inet6 unplumb",
+                     IFCONFIG_PATH, tt->actual_name );
+        argv_msg(M_INFO, &argv);
+        openvpn_execve_check(&argv, NULL, 0, "Solaris ifconfig inet6 unplumb failed");
+        argv_reset(&argv);
+    }
+
+    if (tt->ip_fd >= 0)
+    {
+        struct lifreq ifr;
+        CLEAR(ifr);
+        strncpynt(ifr.lifr_name, tt->actual_name, sizeof(ifr.lifr_name));
+
+        if (ioctl(tt->ip_fd, SIOCGLIFFLAGS, &ifr) < 0)
         {
-            struct argv argv = argv_new();
-            argv_printf( &argv, "%s %s inet6 unplumb",
-                         IFCONFIG_PATH, tt->actual_name );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, NULL, 0, "Solaris ifconfig inet6 unplumb failed");
-            argv_reset(&argv);
+            msg(M_WARN | M_ERRNO, "Can't get iface flags");
         }
 
-        if (tt->ip_fd >= 0)
+        if (ioctl(tt->ip_fd, SIOCGLIFMUXID, &ifr) < 0)
         {
-            struct lifreq ifr;
-            CLEAR(ifr);
-            strncpynt(ifr.lifr_name, tt->actual_name, sizeof(ifr.lifr_name));
-
-            if (ioctl(tt->ip_fd, SIOCGLIFFLAGS, &ifr) < 0)
-            {
-                msg(M_WARN | M_ERRNO, "Can't get iface flags");
-            }
-
-            if (ioctl(tt->ip_fd, SIOCGLIFMUXID, &ifr) < 0)
-            {
-                msg(M_WARN | M_ERRNO, "Can't get multiplexor id");
-            }
-
-            if (tt->type == DEV_TYPE_TAP)
-            {
-                if (ioctl(tt->ip_fd, I_PUNLINK, ifr.lifr_arp_muxid) < 0)
-                {
-                    msg(M_WARN | M_ERRNO, "Can't unlink interface(arp)");
-                }
-            }
-
-            if (ioctl(tt->ip_fd, I_PUNLINK, ifr.lifr_ip_muxid) < 0)
-            {
-                msg(M_WARN | M_ERRNO, "Can't unlink interface(ip)");
-            }
-
-            close(tt->ip_fd);
-            tt->ip_fd = -1;
+            msg(M_WARN | M_ERRNO, "Can't get multiplexor id");
         }
 
-        if (tt->fd >= 0)
+        if (tt->type == DEV_TYPE_TAP)
         {
-            close(tt->fd);
-            tt->fd = -1;
+            if (ioctl(tt->ip_fd, I_PUNLINK, ifr.lifr_arp_muxid) < 0)
+            {
+                msg(M_WARN | M_ERRNO, "Can't unlink interface(arp)");
+            }
         }
+
+        if (ioctl(tt->ip_fd, I_PUNLINK, ifr.lifr_ip_muxid) < 0)
+        {
+            msg(M_WARN | M_ERRNO, "Can't unlink interface(ip)");
+        }
+
+        close(tt->ip_fd);
+        tt->ip_fd = -1;
+    }
+
+    if (tt->fd >= 0)
+    {
+        close(tt->fd);
+        tt->fd = -1;
     }
 }
 
@@ -2487,20 +2343,19 @@ solaris_close_tun(struct tuntap *tt)
  * Close TUN device.
  */
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    if (tt)
+    ASSERT(tt);
+
+    solaris_close_tun(tt);
+
+    if (tt->actual_name)
     {
-        solaris_close_tun(tt);
-
-        if (tt->actual_name)
-        {
-            free(tt->actual_name);
-        }
-
-        clear_tuntap(tt);
-        free(tt);
+        free(tt->actual_name);
     }
+
+    clear_tuntap(tt);
+    free(tt);
 }
 
 static void
@@ -2524,7 +2379,7 @@ solaris_error_close(struct tuntap *tt, const struct env_set *es,
 
     argv_msg(M_INFO, &argv);
     openvpn_execve_check(&argv, es, 0, "Solaris ifconfig unplumb failed");
-    close_tun(tt);
+    close_tun(tt, NULL);
     msg(M_FATAL, "Solaris ifconfig failed");
     argv_reset(&argv);
 }
@@ -2587,33 +2442,34 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
  */
 
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
+    ASSERT(tt);
+
     /* only *TAP* devices need destroying, tun devices auto-self-destruct
      */
-    if (tt && (tt->type == DEV_TYPE_TUN || tt->persistent_if ) )
+    if (tt->type == DEV_TYPE_TUN || tt->persistent_if)
     {
         close_tun_generic(tt);
         free(tt);
+        return;
     }
-    else if (tt)
-    {
-        struct gc_arena gc = gc_new();
-        struct argv argv = argv_new();
 
-        /* setup command, close tun dev (clears tt->actual_name!), run command
-         */
+    struct argv argv = argv_new();
 
-        argv_printf(&argv, "%s %s destroy",
-                    IFCONFIG_PATH, tt->actual_name);
+    /* setup command, close tun dev (clears tt->actual_name!), run command
+     */
 
-        close_tun_generic(tt);
+    argv_printf(&argv, "%s %s destroy",
+                IFCONFIG_PATH, tt->actual_name);
 
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, NULL, 0, "OpenBSD 'destroy tun interface' failed (non-critical)");
+    close_tun_generic(tt);
 
-        free(tt);
-    }
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, NULL, 0, "OpenBSD 'destroy tun interface' failed (non-critical)");
+
+    free(tt);
+    argv_reset(&argv);
 }
 
 int
@@ -2669,36 +2525,37 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 
 /* the current way OpenVPN handles tun devices on NetBSD leads to
  * lingering tunX interfaces after close -> for a full cleanup, they
- * need to be explicitely destroyed
+ * need to be explicitly destroyed
  */
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
+    ASSERT(tt);
+
     /* only tun devices need destroying, tap devices auto-self-destruct
      */
-    if (tt && ( tt->type != DEV_TYPE_TUN || tt->persistent_if ) )
+    if (tt->type != DEV_TYPE_TUN || tt->persistent_if)
     {
         close_tun_generic(tt);
         free(tt);
+        return;
     }
-    else if (tt)
-    {
-        struct gc_arena gc = gc_new();
-        struct argv argv = argv_new();
 
-        /* setup command, close tun dev (clears tt->actual_name!), run command
-         */
+    struct argv argv = argv_new();
 
-        argv_printf(&argv, "%s %s destroy",
-                    IFCONFIG_PATH, tt->actual_name);
+    /* setup command, close tun dev (clears tt->actual_name!), run command
+     */
 
-        close_tun_generic(tt);
+    argv_printf(&argv, "%s %s destroy",
+                IFCONFIG_PATH, tt->actual_name);
 
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, NULL, 0, "NetBSD 'destroy tun interface' failed (non-critical)");
+    close_tun_generic(tt);
 
-        free(tt);
-    }
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, NULL, 0, "NetBSD 'destroy tun interface' failed (non-critical)");
+
+    free(tt);
+    argv_reset(&argv);
 }
 
 static inline int
@@ -2812,30 +2669,34 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
  * we need to call "ifconfig ... destroy" for cleanup
  */
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    if (tt && tt->persistent_if)        /* keep pre-existing if around */
+    ASSERT(tt);
+
+    if (tt->persistent_if)        /* keep pre-existing if around */
     {
         close_tun_generic(tt);
         free(tt);
+        return;
     }
-    else if (tt)                        /* close and destroy */
-    {
-        struct argv argv = argv_new();
 
-        /* setup command, close tun dev (clears tt->actual_name!), run command
-         */
+    /* close and destroy */
+    struct argv argv = argv_new();
 
-        argv_printf(&argv, "%s %s destroy",
-                    IFCONFIG_PATH, tt->actual_name);
+    /* setup command, close tun dev (clears tt->actual_name!), run command
+     */
 
-        close_tun_generic(tt);
+    argv_printf(&argv, "%s %s destroy",
+                IFCONFIG_PATH, tt->actual_name);
 
-        argv_msg(M_INFO, &argv);
-        openvpn_execve_check(&argv, NULL, 0, "FreeBSD 'destroy tun interface' failed (non-critical)");
+    close_tun_generic(tt);
 
-        free(tt);
-    }
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, NULL, 0,
+                         "FreeBSD 'destroy tun interface' failed (non-critical)");
+
+    free(tt);
+    argv_reset(&argv);
 }
 
 int
@@ -2924,13 +2785,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 }
 
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    if (tt)
-    {
-        close_tun_generic(tt);
-        free(tt);
-    }
+    ASSERT(tt);
+
+    close_tun_generic(tt);
+    free(tt);
 }
 
 int
@@ -3092,7 +2952,7 @@ open_darwin_utun(const char *dev, const char *dev_type, const char *dev_node, st
         {
             fd = utun_open_helper(ctlInfo, utunnum);
             /* Break if the fd is valid,
-             * or if early initalization failed (-2) */
+             * or if early initialization failed (-2) */
             if (fd !=-1)
             {
                 break;
@@ -3181,29 +3041,28 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 }
 
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    if (tt)
+    ASSERT(tt);
+
+    struct gc_arena gc = gc_new();
+    struct argv argv = argv_new();
+
+    if (tt->did_ifconfig_ipv6_setup)
     {
-        struct gc_arena gc = gc_new();
-        struct argv argv = argv_new();
+        const char *ifconfig_ipv6_local =
+            print_in6_addr(tt->local_ipv6, 0, &gc);
 
-        if (tt->did_ifconfig_ipv6_setup)
-        {
-            const char *ifconfig_ipv6_local =
-                print_in6_addr(tt->local_ipv6, 0, &gc);
-
-            argv_printf(&argv, "%s delete -inet6 %s",
-                        ROUTE_PATH, ifconfig_ipv6_local );
-            argv_msg(M_INFO, &argv);
-            openvpn_execve_check(&argv, NULL, 0, "MacOS X 'remove inet6 route' failed (non-critical)");
-        }
-
-        close_tun_generic(tt);
-        free(tt);
-        argv_reset(&argv);
-        gc_free(&gc);
+        argv_printf(&argv, "%s delete -inet6 %s",
+                    ROUTE_PATH, ifconfig_ipv6_local );
+        argv_msg(M_INFO, &argv);
+        openvpn_execve_check(&argv, NULL, 0, "MacOS X 'remove inet6 route' failed (non-critical)");
     }
+
+    close_tun_generic(tt);
+    free(tt);
+    argv_reset(&argv);
+    gc_free(&gc);
 }
 
 int
@@ -3306,6 +3165,7 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
         env_set_add( es, "ODMDIR=/etc/objrepos" );
         openvpn_execve_check(&argv, es, S_FATAL, "AIX 'create tun interface' failed");
         env_set_destroy(es);
+        argv_reset(&argv);
     }
     else
     {
@@ -3329,16 +3189,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 /* tap devices need to be manually destroyed on AIX
  */
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    struct gc_arena gc = gc_new();
+    ASSERT(tt);
+
     struct argv argv = argv_new();
     struct env_set *es = env_set_create(NULL);
-
-    if (!tt)
-    {
-        return;
-    }
 
     /* persistent devices need IP address unconfig, others need destroyal
      */
@@ -3360,6 +3216,7 @@ close_tun(struct tuntap *tt)
 
     free(tt);
     env_set_destroy(es);
+    argv_reset(&argv);
 }
 
 int
@@ -3683,7 +3540,8 @@ get_tap_reg(struct gc_arena *gc)
 
                 if (status == ERROR_SUCCESS && data_type == REG_SZ)
                 {
-                    if (!strcmp(component_id, TAP_WIN_COMPONENT_ID))
+                    if (!strcmp(component_id, TAP_WIN_COMPONENT_ID) ||
+                        !strcmp(component_id, "root\\" TAP_WIN_COMPONENT_ID))
                     {
                         struct tap_reg *reg;
                         ALLOC_OBJ_CLEAR_GC(reg, struct tap_reg, gc);
@@ -3790,7 +3648,7 @@ get_panel_reg(struct gc_arena *gc)
 
             if (status != ERROR_SUCCESS || name_type != REG_SZ)
             {
-                dmsg(D_REGISTRY, "Error opening registry key: %s\\%s\\%s",
+                dmsg(D_REGISTRY, "Error opening registry key: %s\\%s\\%ls",
                      NETWORK_CONNECTIONS_KEY, connection_string, name_string);
             }
             else
@@ -4480,6 +4338,7 @@ adapter_index_of_ip(const IP_ADAPTER_INFO *list,
     struct gc_arena gc = gc_new();
     DWORD ret = TUN_ADAPTER_INDEX_INVALID;
     in_addr_t highest_netmask = 0;
+    int lowest_metric = INT_MAX;
     bool first = true;
 
     if (count)
@@ -4493,9 +4352,14 @@ adapter_index_of_ip(const IP_ADAPTER_INFO *list,
 
         if (is_ip_in_adapter_subnet(list, ip, &hn))
         {
+            int metric = get_interface_metric(list->Index, AF_INET, NULL);
             if (first || hn > highest_netmask)
             {
                 highest_netmask = hn;
+                if (metric >= 0)
+                {
+                    lowest_metric = metric;
+                }
                 if (count)
                 {
                     *count = 1;
@@ -4509,16 +4373,22 @@ adapter_index_of_ip(const IP_ADAPTER_INFO *list,
                 {
                     ++*count;
                 }
+                if (metric >= 0 && metric < lowest_metric)
+                {
+                    ret = list->Index;
+                    lowest_metric = metric;
+                }
             }
         }
         list = list->Next;
     }
 
-    dmsg(D_ROUTE_DEBUG, "DEBUG: IP Locate: ip=%s nm=%s index=%d count=%d",
+    dmsg(D_ROUTE_DEBUG, "DEBUG: IP Locate: ip=%s nm=%s index=%d count=%d metric=%d",
          print_in_addr_t(ip, 0, &gc),
          print_in_addr_t(highest_netmask, 0, &gc),
          (int)ret,
-         count ? *count : -1);
+         count ? *count : -1,
+         lowest_metric);
 
     if (ret == TUN_ADAPTER_INDEX_INVALID && count)
     {
@@ -4619,8 +4489,7 @@ get_adapter_index_method_1(const char *guid)
     DWORD index;
     ULONG aindex;
     wchar_t wbuf[256];
-    swprintf(wbuf, SIZE(wbuf), L"\\DEVICE\\TCPIP_%S", guid);
-    wbuf [SIZE(wbuf) - 1] = 0;
+    openvpn_swprintf(wbuf, SIZE(wbuf), L"\\DEVICE\\TCPIP_%S", guid);
     if (GetAdapterIndex(wbuf, &aindex) != NO_ERROR)
     {
         index = TUN_ADAPTER_INDEX_INVALID;
@@ -5014,7 +4883,6 @@ void
 ipconfig_register_dns(const struct env_set *es)
 {
     struct argv argv = argv_new();
-    bool status;
     const char err[] = "ERROR: Windows ipconfig command failed";
 
     msg(D_TUNTAP_INFO, "Start ipconfig commands for register-dns...");
@@ -5024,14 +4892,14 @@ ipconfig_register_dns(const struct env_set *es)
                 get_win_sys_path(),
                 WIN_IPCONFIG_PATH_SUFFIX);
     argv_msg(D_TUNTAP_INFO, &argv);
-    status = openvpn_execve_check(&argv, es, 0, err);
+    openvpn_execve_check(&argv, es, 0, err);
     argv_reset(&argv);
 
     argv_printf(&argv, "%s%sc /registerdns",
                 get_win_sys_path(),
                 WIN_IPCONFIG_PATH_SUFFIX);
     argv_msg(D_TUNTAP_INFO, &argv);
-    status = openvpn_execve_check(&argv, es, 0, err);
+    openvpn_execve_check(&argv, es, 0, err);
     argv_reset(&argv);
 
     netcmd_semaphore_release();
@@ -5325,8 +5193,7 @@ netsh_ifconfig(const struct tuntap_options *to,
 }
 
 static void
-netsh_enable_dhcp(const struct tuntap_options *to,
-                  const char *actual_name)
+netsh_enable_dhcp(const char *actual_name)
 {
     struct argv argv = argv_new();
 
@@ -5340,6 +5207,45 @@ netsh_enable_dhcp(const struct tuntap_options *to,
     netsh_command(&argv, 4, M_FATAL);
 
     argv_reset(&argv);
+}
+
+/* Enable dhcp on tap adapter using iservice */
+static bool
+service_enable_dhcp(const struct tuntap *tt)
+{
+    bool ret = false;
+    ack_message_t ack;
+    struct gc_arena gc = gc_new();
+    HANDLE pipe = tt->options.msg_channel;
+
+    enable_dhcp_message_t dhcp = {
+        .header = {
+            msg_enable_dhcp,
+            sizeof(enable_dhcp_message_t),
+            0
+        },
+        .iface = { .index = tt->adapter_index, .name = "" }
+    };
+
+    if (!send_msg_iservice(pipe, &dhcp, sizeof(dhcp), &ack, "Enable_dhcp"))
+    {
+        goto out;
+    }
+
+    if (ack.error_number != NO_ERROR)
+    {
+        msg(M_NONFATAL, "TUN: enabling dhcp using service failed: %s [status=%u if_index=%d]",
+            strerror_win32(ack.error_number, &gc), ack.error_number, dhcp.iface.index);
+    }
+    else
+    {
+        msg(M_INFO, "DHCP enabled on interface %d using service", dhcp.iface.index);
+        ret = true;
+    }
+
+out:
+    gc_free(&gc);
+    return ret;
 }
 
 /*
@@ -5547,7 +5453,7 @@ fork_dhcp_action(struct tuntap *tt)
         {
             buf_printf(&cmd, " --dhcp-renew");
         }
-        buf_printf(&cmd, " --dhcp-internal %u", (unsigned int)tt->adapter_index);
+        buf_printf(&cmd, " --dhcp-internal %lu", tt->adapter_index);
 
         fork_to_self(BSTR(&cmd));
         gc_free(&gc);
@@ -5557,18 +5463,16 @@ fork_dhcp_action(struct tuntap *tt)
 static void
 register_dns_service(const struct tuntap *tt)
 {
-    DWORD len;
     HANDLE msg_channel = tt->options.msg_channel;
     ack_message_t ack;
     struct gc_arena gc = gc_new();
 
     message_header_t rdns = { msg_register_dns, sizeof(message_header_t), 0 };
 
-    if (!WriteFile(msg_channel, &rdns, sizeof(rdns), &len, NULL)
-        || !ReadFile(msg_channel, &ack, sizeof(ack), &len, NULL))
+    if (!send_msg_iservice(msg_channel, &rdns, sizeof(rdns), &ack, "Register_dns"))
     {
-        msg(M_WARN, "Register_dns: could not talk to service: %s [status=0x%lx]",
-            strerror_win32(GetLastError(), &gc), GetLastError());
+        gc_free(&gc);
+        return;
     }
 
     else if (ack.error_number != NO_ERROR)
@@ -5822,7 +5726,15 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
              */
             if (dhcp_status(tt->adapter_index) == DHCP_STATUS_DISABLED)
             {
-                netsh_enable_dhcp(&tt->options, tt->actual_name);
+                /* try using the service if available, else directly execute netsh */
+                if (tt->options.msg_channel)
+                {
+                    service_enable_dhcp(tt);
+                }
+                else
+                {
+                    netsh_enable_dhcp(tt->actual_name);
+                }
             }
             dhcp_masq = true;
             dhcp_masq_post = true;
@@ -5851,12 +5763,15 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 
     if (tt->type == DEV_TYPE_TUN)
     {
-        if (!tt->did_ifconfig_setup)
+        if (!tt->did_ifconfig_setup && !tt->did_ifconfig_ipv6_setup)
         {
             msg(M_FATAL, "ERROR: --dev tun also requires --ifconfig");
         }
 
-        if (tt->topology == TOP_SUBNET)
+        /* send 0/0/0 to the TAP driver even if we have no IPv4 configured to
+         * ensure it is somehow initialized.
+         */
+        if (!tt->did_ifconfig_setup || tt->topology == TOP_SUBNET)
         {
             in_addr_t ep[3];
             BOOL status;
@@ -5869,12 +5784,19 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
                                      ep, sizeof(ep),
                                      ep, sizeof(ep), &len, NULL);
 
-            msg(status ? M_INFO : M_FATAL, "Set TAP-Windows TUN subnet mode network/local/netmask = %s/%s/%s [%s]",
-                print_in_addr_t(ep[1], IA_NET_ORDER, &gc),
-                print_in_addr_t(ep[0], IA_NET_ORDER, &gc),
-                print_in_addr_t(ep[2], IA_NET_ORDER, &gc),
-                status ? "SUCCEEDED" : "FAILED");
-
+            if (tt->did_ifconfig_setup)
+            {
+                msg(status ? M_INFO : M_FATAL, "Set TAP-Windows TUN subnet mode network/local/netmask = %s/%s/%s [%s]",
+                    print_in_addr_t(ep[1], IA_NET_ORDER, &gc),
+                    print_in_addr_t(ep[0], IA_NET_ORDER, &gc),
+                    print_in_addr_t(ep[2], IA_NET_ORDER, &gc),
+                    status ? "SUCCEEDED" : "FAILED");
+            }
+            else
+            {
+                msg(status ? M_INFO : M_FATAL, "Set TAP-Windows TUN with fake IPv4 [%s]",
+                    status ? "SUCCEEDED" : "FAILED");
+            }
         }
         else
         {
@@ -6014,14 +5936,11 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
                     .iface = { .index = index, .name = "" }
                 };
 
-                if (!WriteFile(tt->options.msg_channel, &msg, sizeof(msg), &len, NULL)
-                    || !ReadFile(tt->options.msg_channel, &ack, sizeof(ack), &len, NULL))
+                if (send_msg_iservice(tt->options.msg_channel, &msg, sizeof(msg),
+                                      &ack, "TUN"))
                 {
-                    msg(M_WARN, "TUN: could not talk to service: %s [%lu]",
-                        strerror_win32(GetLastError(), &gc), GetLastError());
+                    status = ack.error_number;
                 }
-
-                status = ack.error_number;
             }
             else
             {
@@ -6030,16 +5949,16 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 
             if (status == NO_ERROR)
             {
-                msg(M_INFO, "Successful ARP Flush on interface [%u] %s",
-                    (unsigned int)index,
+                msg(M_INFO, "Successful ARP Flush on interface [%lu] %s",
+                    index,
                     device_guid);
             }
             else if (status != -1)
             {
-                msg(D_TUNTAP_INFO, "NOTE: FlushIpNetTable failed on interface [%u] %s (status=%u) : %s",
-                    (unsigned int)index,
+                msg(D_TUNTAP_INFO, "NOTE: FlushIpNetTable failed on interface [%lu] %s (status=%lu) : %s",
+                    index,
                     device_guid,
-                    (unsigned int)status,
+                    status,
                     strerror_win32(status, &gc));
             }
         }
@@ -6110,12 +6029,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
             }
             else
             {
-                msg(M_FATAL, "ERROR: AddIPAddress %s/%s failed on interface %s, index=%d, status=%u (windows error: '%s') -- %s",
+                msg(M_FATAL, "ERROR: AddIPAddress %s/%s failed on interface %s, index=%lu, status=%lu (windows error: '%s') -- %s",
                     print_in_addr_t(tt->local, 0, &gc),
                     print_in_addr_t(tt->adapter_netmask, 0, &gc),
                     device_guid,
-                    (int)index,
-                    (unsigned int)status,
+                    index,
+                    status,
                     strerror_win32(status, &gc),
                     error_suffix);
             }
@@ -6163,106 +6082,105 @@ tun_show_debug(struct tuntap *tt)
 }
 
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
+    ASSERT(tt);
+
     struct gc_arena gc = gc_new();
 
-    if (tt)
+    if (tt->did_ifconfig_ipv6_setup)
     {
-        if (tt->did_ifconfig_ipv6_setup)
+        /* remove route pointing to interface */
+        delete_route_connected_v6_net(tt, NULL);
+
+        if (tt->options.msg_channel)
         {
-            if (tt->options.msg_channel)
+            do_address_service(false, AF_INET6, tt);
+            if (tt->options.dns6_len > 0)
             {
-                do_address_service(false, AF_INET6, tt);
-                if (tt->options.dns6_len > 0)
-                {
-                    do_dns6_service(false, tt);
-                }
+                do_dns6_service(false, tt);
             }
-            else
+        }
+        else
+        {
+            const char *ifconfig_ipv6_local;
+            struct argv argv = argv_new();
+
+            /* "store=active" is needed in Windows 8(.1) to delete the
+             * address we added (pointed out by Cedric Tabary).
+             */
+
+            /* netsh interface ipv6 delete address \"%s\" %s */
+            ifconfig_ipv6_local = print_in6_addr(tt->local_ipv6, 0,  &gc);
+            argv_printf(&argv,
+                        "%s%sc interface ipv6 delete address %s %s store=active",
+                        get_win_sys_path(),
+                        NETSH_PATH_SUFFIX,
+                        tt->actual_name,
+                        ifconfig_ipv6_local);
+
+            netsh_command(&argv, 1, M_WARN);
+
+            /* delete ipv6 dns servers if any were set */
+            if (tt->options.dns6_len > 0)
             {
-                const char *ifconfig_ipv6_local;
-                struct argv argv = argv_new();
-
-                /* remove route pointing to interface */
-                delete_route_connected_v6_net(tt, NULL);
-
-                /* "store=active" is needed in Windows 8(.1) to delete the
-                 * address we added (pointed out by Cedric Tabary).
-                 */
-
-                /* netsh interface ipv6 delete address \"%s\" %s */
-                ifconfig_ipv6_local = print_in6_addr(tt->local_ipv6, 0,  &gc);
                 argv_printf(&argv,
-                            "%s%sc interface ipv6 delete address %s %s store=active",
+                            "%s%sc interface ipv6 delete dns %s all",
                             get_win_sys_path(),
                             NETSH_PATH_SUFFIX,
-                            tt->actual_name,
-                            ifconfig_ipv6_local);
-
+                            tt->actual_name);
                 netsh_command(&argv, 1, M_WARN);
-
-                /* delete ipv6 dns servers if any were set */
-                if (tt->options.dns6_len > 0)
-                {
-                    argv_printf(&argv,
-                                "%s%sc interface ipv6 delete dns %s all",
-                                get_win_sys_path(),
-                                NETSH_PATH_SUFFIX,
-                                tt->actual_name);
-                    netsh_command(&argv, 1, M_WARN);
-                }
-                argv_reset(&argv);
             }
+            argv_reset(&argv);
         }
+    }
 #if 1
-        if (tt->ipapi_context_defined)
+    if (tt->ipapi_context_defined)
+    {
+        DWORD status;
+        if ((status = DeleteIPAddress(tt->ipapi_context)) != NO_ERROR)
         {
-            DWORD status;
-            if ((status = DeleteIPAddress(tt->ipapi_context)) != NO_ERROR)
-            {
-                msg(M_WARN, "Warning: DeleteIPAddress[%u] failed on TAP-Windows adapter, status=%u : %s",
-                    (unsigned int)tt->ipapi_context,
-                    (unsigned int)status,
-                    strerror_win32(status, &gc));
-            }
+            msg(M_WARN, "Warning: DeleteIPAddress[%u] failed on TAP-Windows adapter, status=%u : %s",
+                (unsigned int)tt->ipapi_context,
+                (unsigned int)status,
+                strerror_win32(status, &gc));
         }
+    }
 #endif
 
-        dhcp_release(tt);
+    dhcp_release(tt);
 
-        if (tt->hand != NULL)
+    if (tt->hand != NULL)
+    {
+        dmsg(D_WIN32_IO_LOW, "Attempting CancelIO on TAP-Windows adapter");
+        if (!CancelIo(tt->hand))
         {
-            dmsg(D_WIN32_IO_LOW, "Attempting CancelIO on TAP-Windows adapter");
-            if (!CancelIo(tt->hand))
-            {
-                msg(M_WARN | M_ERRNO, "Warning: CancelIO failed on TAP-Windows adapter");
-            }
+            msg(M_WARN | M_ERRNO, "Warning: CancelIO failed on TAP-Windows adapter");
         }
-
-        dmsg(D_WIN32_IO_LOW, "Attempting close of overlapped read event on TAP-Windows adapter");
-        overlapped_io_close(&tt->reads);
-
-        dmsg(D_WIN32_IO_LOW, "Attempting close of overlapped write event on TAP-Windows adapter");
-        overlapped_io_close(&tt->writes);
-
-        if (tt->hand != NULL)
-        {
-            dmsg(D_WIN32_IO_LOW, "Attempting CloseHandle on TAP-Windows adapter");
-            if (!CloseHandle(tt->hand))
-            {
-                msg(M_WARN | M_ERRNO, "Warning: CloseHandle failed on TAP-Windows adapter");
-            }
-        }
-
-        if (tt->actual_name)
-        {
-            free(tt->actual_name);
-        }
-
-        clear_tuntap(tt);
-        free(tt);
     }
+
+    dmsg(D_WIN32_IO_LOW, "Attempting close of overlapped read event on TAP-Windows adapter");
+    overlapped_io_close(&tt->reads);
+
+    dmsg(D_WIN32_IO_LOW, "Attempting close of overlapped write event on TAP-Windows adapter");
+    overlapped_io_close(&tt->writes);
+
+    if (tt->hand != NULL)
+    {
+        dmsg(D_WIN32_IO_LOW, "Attempting CloseHandle on TAP-Windows adapter");
+        if (!CloseHandle(tt->hand))
+        {
+            msg(M_WARN | M_ERRNO, "Warning: CloseHandle failed on TAP-Windows adapter");
+        }
+    }
+
+    if (tt->actual_name)
+    {
+        free(tt->actual_name);
+    }
+
+    clear_tuntap(tt);
+    free(tt);
     gc_free(&gc);
 }
 
@@ -6339,13 +6257,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
 }
 
 void
-close_tun(struct tuntap *tt)
+close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 {
-    if (tt)
-    {
-        close_tun_generic(tt);
-        free(tt);
-    }
+    ASSERT(tt);
+
+    close_tun_generic(tt);
+    free(tt);
 }
 
 int

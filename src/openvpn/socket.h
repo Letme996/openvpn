@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -99,7 +99,7 @@ struct link_socket_actual
 #endif
 };
 
-/* IP addresses which are persistant across SIGUSR1s */
+/* IP addresses which are persistent across SIGUSR1s */
 struct link_socket_addr
 {
     struct addrinfo *bind_local;
@@ -138,7 +138,7 @@ struct stream_buf
     int len;   /* -1 if not yet known */
 
     bool error; /* if true, fatal TCP error has occurred,
-                *  requiring that connection be restarted */
+                 *  requiring that connection be restarted */
 #if PORT_SHARE
 #define PS_DISABLED 0
 #define PS_ENABLED  1
@@ -532,11 +532,23 @@ bool unix_socket_get_peer_uid_gid(const socket_descriptor_t sd, int *uid, int *g
 
 #define GETADDR_CACHE_MASK              (GETADDR_DATAGRAM|GETADDR_PASSIVE)
 
+/**
+ * Translate an IPv4 addr or hostname from string form to in_addr_t
+ *
+ * In case of resolve error, it will try again for
+ * resolve_retry_seconds seconds.
+ */
 in_addr_t getaddr(unsigned int flags,
                   const char *hostname,
                   int resolve_retry_seconds,
                   bool *succeeded,
                   volatile int *signal_received);
+
+/**
+ * Translate an IPv6 addr or hostname from string form to in6_addr
+ */
+bool get_ipv6_addr(const char *hostname, struct in6_addr *network,
+                   unsigned int *netbits, int msglevel);
 
 int openvpn_getaddrinfo(unsigned int flags,
                         const char *hostname,
@@ -994,26 +1006,11 @@ link_socket_set_outgoing_addr(const struct buffer *buf,
     }
 }
 
-/*
- * Stream buffer handling -- stream_buf is a helper class
- * to assist in the packetization of stream transport protocols
- * such as TCP.
- */
-
-void stream_buf_init(struct stream_buf *sb,
-                     struct buffer *buf,
-                     const unsigned int sockflags,
-                     const int proto);
-
-void stream_buf_close(struct stream_buf *sb);
-
-bool stream_buf_added(struct stream_buf *sb, int length_added);
+bool stream_buf_read_setup_dowork(struct link_socket *sock);
 
 static inline bool
 stream_buf_read_setup(struct link_socket *sock)
 {
-    bool stream_buf_read_setup_dowork(struct link_socket *sock);
-
     if (link_socket_connection_oriented(sock))
     {
         return stream_buf_read_setup_dowork(sock);
@@ -1118,16 +1115,17 @@ link_socket_write_win32(struct link_socket *sock,
 
 #else  /* ifdef _WIN32 */
 
+size_t link_socket_write_udp_posix_sendmsg(struct link_socket *sock,
+                                           struct buffer *buf,
+                                           struct link_socket_actual *to);
+
+
 static inline size_t
 link_socket_write_udp_posix(struct link_socket *sock,
                             struct buffer *buf,
                             struct link_socket_actual *to)
 {
 #if ENABLE_IP_PKTINFO
-    size_t link_socket_write_udp_posix_sendmsg(struct link_socket *sock,
-                                               struct buffer *buf,
-                                               struct link_socket_actual *to);
-
     if (proto_is_udp(sock->info.proto) && (sock->sockflags & SF_USE_IP_PKTINFO)
         && addr_defined_ipi(to))
     {

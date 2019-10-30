@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -130,6 +130,20 @@ struct connection_entry
 #define CE_MAN_QUERY_REMOTE_MASK   (0x07)
 #define CE_MAN_QUERY_REMOTE_SHIFT  (2)
     unsigned int flags;
+
+    /* Shared secret used for TLS control channel authentication */
+    const char *tls_auth_file;
+    const char *tls_auth_file_inline;
+    int key_direction;
+
+    /* Shared secret used for TLS control channel authenticated encryption */
+    const char *tls_crypt_file;
+    const char *tls_crypt_inline;
+
+    /* Client-specific secret or server key used for TLS control channel
+     * authenticated encryption v2 */
+    const char *tls_crypt_v2_file;
+    const char *tls_crypt_v2_inline;
 };
 
 struct remote_entry
@@ -163,6 +177,13 @@ struct remote_host_store
     char port[RH_PORT_LEN];
 };
 
+enum genkey_type {
+    GENKEY_SECRET,
+    GENKEY_TLS_CRYPTV2_CLIENT,
+    GENKEY_TLS_CRYPTV2_SERVER,
+    GENKEY_AUTH_TOKEN
+};
+
 /* Command line options */
 struct options
 {
@@ -193,6 +214,9 @@ struct options
     bool show_tls_ciphers;
     bool show_curves;
     bool genkey;
+    enum genkey_type genkey_type;
+    const char* genkey_filename;
+    const char* genkey_extra_data;
 
     /* Networking parms */
     int connect_retry_max;
@@ -329,6 +353,7 @@ struct options
     const char *route_script;
     const char *route_predown_script;
     const char *route_default_gateway;
+    const char *route_ipv6_default_gateway;
     int route_default_metric;
     bool route_noexec;
     int route_delay;
@@ -336,6 +361,7 @@ struct options
     bool route_delay_defined;
     struct route_option_list *routes;
     struct route_ipv6_option_list *routes_ipv6;                 /* IPv6 */
+    bool block_ipv6;
     bool route_nopull;
     bool route_gateway_via_dhcp;
     bool allow_pull_fqdn; /* as a client, allow server to push a FQDN for certain parameters */
@@ -425,6 +451,7 @@ struct options
     bool push_ifconfig_constraint_defined;
     in_addr_t push_ifconfig_constraint_network;
     in_addr_t push_ifconfig_constraint_netmask;
+    bool push_ifconfig_ipv4_blocked;                    /* IPv4 */
     bool push_ifconfig_ipv6_defined;                    /* IPv6 */
     struct in6_addr push_ifconfig_ipv6_local;           /* IPv6 */
     int push_ifconfig_ipv6_netbits;                     /* IPv6 */
@@ -442,7 +469,12 @@ struct options
     const char *auth_user_pass_verify_script;
     bool auth_user_pass_verify_script_via_file;
     bool auth_token_generate;
-    unsigned int auth_token_lifetime;
+    bool auth_token_gen_secret_file;
+    bool auth_token_call_auth;
+    int auth_token_lifetime;
+    const char *auth_token_secret_file;
+    const char *auth_token_secret_file_inline;
+
 #if PORT_SHARE
     char *port_share_host;
     char *port_share_port;
@@ -459,7 +491,7 @@ struct options
 
     int scheduled_exit_interval;
 
-#ifdef ENABLE_CLIENT_CR
+#ifdef ENABLE_MANAGEMENT
     struct static_challenge_info sc_info;
 #endif
 #endif /* if P2MP */
@@ -497,6 +529,7 @@ struct options
     const char *priv_key_file;
     const char *pkcs12_file;
     const char *cipher_list;
+    const char *cipher_list_tls13;
     const char *tls_cert_profile;
     const char *ecdh_curve;
     const char *tls_verify;
@@ -565,6 +598,15 @@ struct options
     /* Shared secret used for TLS control channel authenticated encryption */
     const char *tls_crypt_file;
     const char *tls_crypt_inline;
+
+    /* Client-specific secret or server key used for TLS control channel
+     * authenticated encryption v2 */
+    const char *tls_crypt_v2_file;
+    const char *tls_crypt_v2_inline;
+
+    const char *tls_crypt_v2_metadata;
+
+    const char *tls_crypt_v2_verify_script;
 
     /* Allow only one session */
     bool single_session;
@@ -715,6 +757,7 @@ const char *options_string_version(const char *s, struct gc_arena *gc);
 char *options_string(const struct options *o,
                      const struct frame *frame,
                      struct tuntap *tt,
+                     openvpn_net_ctx_t *ctx,
                      bool remote,
                      struct gc_arena *gc);
 
@@ -807,9 +850,5 @@ void options_string_import(struct options *options,
                            const unsigned int permission_mask,
                            unsigned int *option_types_found,
                            struct env_set *es);
-
-bool get_ipv6_addr( const char *prefix_str, struct in6_addr *network,
-                    unsigned int *netbits, int msglevel );
-
 
 #endif /* ifndef OPTIONS_H */
